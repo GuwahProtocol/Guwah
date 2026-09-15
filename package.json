@@ -1,0 +1,36 @@
+{
+  "name": "guwah-mcp-extension",
+  "version": "0.1.0",
+  "private": true,
+  "license": "Apache-2.0",
+  "description": "Gateway for User-Whitelisted Agent Handshakes — local, fail-closed MCP tool-call guard.",
+  "type": "module",
+  "engines": {
+    "node": "^20.19.0 || >=22.12.0"
+  },
+  "main": "./dist/guwahGuard.js",
+  "types": "./dist/guwahGuard.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/guwahGuard.d.ts",
+      "import": "./dist/guwahGuard.js"
+    }
+  },
+  "files": [
+    "dist",
+    "guwah-policy.json"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "ajv": "^8.17.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20.19.0",
+    "typescript": "^5.9.2",
+    "vitest": "^3.2.4"
+  }
+}

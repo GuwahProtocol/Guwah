@@ -1,0 +1,49 @@
+{
+  "version": "1.0.0",
+  "posture": "default-deny",
+  "tools": {
+    "coinbase_cdp_transfer": {
+      "action": "ENFORCE",
+      "argsSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "amountMinor",
+          "assetId",
+          "destinationAddress",
+          "memo"
+        ],
+        "properties": {
+          "amountMinor": {
+            "type": "integer",
+            "description": "Transfer amount in integer minor units. $50.00 is 5000. IEEE-754 dollar floats are not accepted.",
+            "minimum": 1,
+            "maximum": 5000
+          },
+          "assetId": {
+            "type": "string",
+            "description": "Whitelisted settlement asset identifier.",
+            "enum": ["USDC"]
+          },
+          "destinationAddress": {
+            "type": "string",
+            "description": "Mock EVM address that must both match address structure and an explicit local whitelist.",
+            "pattern": "^0x[0-9a-fA-F]{40}$",
+            "enum": [
+              "0x1111111111111111111111111111111111111111",
+              "0x2222222222222222222222222222222222222222"
+            ]
+          },
+          "memo": {
+            "type": "string",
+            "description": "Conservative invoice memo. Letters, digits, spaces, and . , _ - : only. Rejects shell operators, markup, control characters, and SQL-style punctuation.",
+            "minLength": 1,
+            "maxLength": 80,
+            "pattern": "^[A-Za-z0-9 .,_:-]+$"
+          }
+        }
+      }
+    }
+  }
+}
