@@ -14,7 +14,7 @@ Guwah is a local, client-side policy enforcement layer for Model Context Protoco
 |---|---|
 | Execution locus | Local process |
 | Trust posture | Default deny |
-| Transport | None in the core module |
+| Transport | None in the core validator; stdio in the gateway entry |
 | Provider coupling | None; MCP SDK agnostic |
 | Financial units | Integer minor units (`amountMinor`) |
 | Failure mode | Throw `GuwahSecurityViolation` |
@@ -23,7 +23,7 @@ Guwah is a local, client-side policy enforcement layer for Model Context Protoco
 
 ## Execution Model
 
-The core package terminates at local approval or denial. Network I/O is the responsibility of the integrating runtime, which must transmit only the approved return value.
+The core validator terminates at local approval or denial. The gateway entry speaks MCP over stdio. Downstream tool execution is not implemented in this package yet.
 
 ```text
   [ Agent runtime ]
@@ -57,7 +57,7 @@ The core package terminates at local approval or denial. Network I/O is the resp
 
 `params._meta`, when present, is optional MCP protocol metadata. It is preserved in the approved copy, included in JSON-graph and resource-limit checks, and is not validated against the tool `argsSchema` or compared with candidate arguments.
 
-Vendor APIs (for example, a Coinbase-named mock tool in the sample policy) are downstream of the integrator. Guwah does not import Stripe, Coinbase, or MCP vendor SDKs and does not open sockets.
+Vendor APIs (for example, a Coinbase-named mock tool in the sample policy) are downstream of the integrator. The core validator does not import Stripe, Coinbase, or MCP vendor SDKs and does not open sockets. The protocol adapter imports the official MCP TypeScript SDK for host `tools/call` shaping only and still delegates every approval to `GuwahGuard`. The gateway entry uses the official SDK stdio transport. Stdout is reserved for protocol frames.
 
 ---
 
@@ -87,17 +87,21 @@ The suite covers approved transfers, amount and destination policy failures, pay
 ## Core Architecture
 
 ```text
-src/guwahGuard.ts      Runtime validation engine
+src/guwahGuard.ts         Runtime validation engine
+src/guwahMcpAdapter.ts    Host tools/call adapter; calls GuwahGuard
+src/guwahGateway.ts       Node stdio gateway entry
 test/guwahGuard.test.ts
-guwah-policy.json      Local operator policy
+test/guwahMcpAdapter.test.ts
+test/guwahGateway.test.ts
+guwah-policy.json         Local operator policy
 package.json
-tsconfig.json          Shared typecheck configuration
-tsconfig.build.json    Production emit (src only)
+tsconfig.json             Shared typecheck configuration
+tsconfig.build.json       Production emit (src only)
 vitest.config.ts
 LICENSE
 ```
 
-`npm run build` writes only runtime artifacts under `dist/` (`guwahGuard.js` and corresponding declarations and source maps). Test sources are not emitted.
+`npm run build` writes runtime artifacts under `dist/` (`guwahGuard.js`, `guwahMcpAdapter.js`, `guwahGateway.js`, and corresponding declarations and source maps). Test sources are not emitted. The package export remains the validator module. `node dist/guwahGateway.js` starts the stdio gateway.
 
 ### `src/guwahGuard.ts`
 
