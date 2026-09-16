@@ -1,6 +1,9 @@
 import path from "node:path";
+import { readFileSync } from "node:fs";
 import type { Readable, Writable } from "node:stream";
 import { fileURLToPath } from "node:url";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import {
@@ -16,6 +19,12 @@ import { GuwahGuard, GuwahSecurityViolation, type GuwahViolationCode, type McpTo
 
 export const GUWAH_GATEWAY_NAME = "guwah";
 export const GUWAH_GATEWAY_VERSION = "0.1.0";
+export const GUWAH_DOWNSTREAM_CLIENT_NAME = "guwah-downstream";
+export const GUWAH_DOWNSTREAM_CLIENT_VERSION = GUWAH_GATEWAY_VERSION;
+export const GUWAH_DOWNSTREAM_TRANSPORT_CONFIG_ERROR =
+  "Downstream transport configuration is missing or invalid.";
+export const GUWAH_DOWNSTREAM_CONNECTION_ERROR = "Downstream MCP connection failed.";
+export const GUWAH_DOWNSTREAM_CONNECTION_DEAD_ERROR = "Downstream MCP connection is dead.";
 
 /**
  * Stable Guwah violation → MCP JSON-RPC error mapping.
@@ -286,6 +295,12 @@ export type GuwahStdioGatewayOptions = {
   readonly afterApproval?: (
     approved: Readonly<McpToolCallPayload>,
   ) => CallToolResult | Promise<CallToolResult>;
+  /**
+   * Local path to downstream MCP transport configuration.
+   * When set, the file must load and validate or startup fails closed.
+   * When omitted, no downstream transport is configured (deny-all; no implicit localhost).
+   */
+  readonly downstreamTransportConfigPath?: string;
   /**
    * Invoked when the stdio transport fails.
    * When omitted, the process writes a sanitized stderr line and exits non-zero.
@@ -577,11 +592,259 @@ function resolveGuard(options?: GuwahGatewayServerOptions): GuwahGuard {
 }
 
 /**
+ * Constructs the official MCP SDK client for gateway-owned downstream mediation.
+ * Used only by the gateway process. Validator and adapter modules must not import it.
+ * Construction failure is fail-closed; never substitute an open-proxy client.
+ */
+export function createGuwahDownstreamClient(options?: {
+  readonly name?: string;
+  readonly version?: string;
+}): Client {
+  const name = options?.name ?? GUWAH_DOWNSTREAM_CLIENT_NAME;
+  const version = options?.version ?? GUWAH_DOWNSTREAM_CLIENT_VERSION;
+  if (typeof name !== "string" || name.trim().length === 0) {
+    throw new Error("Downstream MCP client construction failed.");
+  }
+  if (typeof version !== "string" || version.trim().length === 0) {
+    throw new Error("Downstream MCP client construction failed.");
+  }
+  try {
+    return new Client({ name, version });
+  } catch {
+    // Fail closed: do not return a passthrough or unofficial substitute.
+    throw new Error("Downstream MCP client construction failed.");
+  }
+}
+
+/**
+ * Local stdio spawn configuration for a downstream MCP server.
+ * HTTP and SSE are not admitted. Cloud service catalogs are out of scope.
+ */
+export type GuwahDownstreamStdioTransportConfig = {
+  readonly transport: "stdio";
+  readonly command: string;
+  readonly args?: readonly string[];
+  readonly cwd?: string;
+};
+
+export type GuwahDownstreamTransportConfig = GuwahDownstreamStdioTransportConfig;
+
+function failDownstreamTransportConfig(): never {
+  throw new Error(GUWAH_DOWNSTREAM_TRANSPORT_CONFIG_ERROR);
+}
+
+function assertNonEmptyString(value: unknown): string {
+  if (typeof value !== "string" || value.trim().length === 0) {
+    failDownstreamTransportConfig();
+  }
+  return value;
+}
+
+function parseDownstreamTransportConfig(raw: unknown): GuwahDownstreamTransportConfig {
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+    failDownstreamTransportConfig();
+  }
+  const record = raw as Record<string, unknown>;
+  const keys = Object.keys(record);
+  for (const key of keys) {
+    if (key === "__proto__" || key === "prototype" || key === "constructor") {
+      failDownstreamTransportConfig();
+    }
+  }
+  const allowed = new Set(["transport", "command", "args", "cwd"]);
+  for (const key of keys) {
+    if (!allowed.has(key)) {
+      failDownstreamTransportConfig();
+    }
+  }
+  if (record["transport"] !== "stdio") {
+    // Only local stdio spawn is supported; do not invent an implicit localhost HTTP tool.
+    failDownstreamTransportConfig();
+  }
+  const command = assertNonEmptyString(record["command"]);
+  const config: {
+    transport: "stdio";
+    command: string;
+    args?: readonly string[];
+    cwd?: string;
+  } = {
+    transport: "stdio",
+    command,
+  };
+  if (Object.prototype.hasOwnProperty.call(record, "args")) {
+    const argsValue: unknown = record["args"];
+    if (!Array.isArray(argsValue)) {
+      failDownstreamTransportConfig();
+    }
+    const args: string[] = [];
+    for (const entry of argsValue) {
+      args.push(assertNonEmptyString(entry));
+    }
+    config.args = Object.freeze(args);
+  }
+  if (Object.prototype.hasOwnProperty.call(record, "cwd")) {
+    config.cwd = assertNonEmptyString(record["cwd"]);
+  }
+  return Object.freeze(config);
+}
+
+/**
+ * Loads and validates local downstream transport configuration from disk.
+ * Missing files and invalid documents fail closed.
+ */
+export function loadGuwahDownstreamTransportConfig(
+  configPath: string,
+): GuwahDownstreamTransportConfig {
+  if (typeof configPath !== "string" || configPath.trim().length === 0) {
+    failDownstreamTransportConfig();
+  }
+  const resolved = path.resolve(configPath);
+  let text: string;
+  try {
+    text = readFileSync(resolved, "utf8");
+  } catch {
+    failDownstreamTransportConfig();
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text) as unknown;
+  } catch {
+    failDownstreamTransportConfig();
+  }
+  return parseDownstreamTransportConfig(parsed);
+}
+
+/**
+ * Resolves optional downstream transport configuration.
+ * Omitted path means deny-all: no downstream transport and no implicit localhost tool.
+ * A provided path must load successfully or this throws.
+ */
+export function resolveGuwahDownstreamTransportConfig(options?: {
+  readonly configPath?: string;
+}): GuwahDownstreamTransportConfig | undefined {
+  if (options?.configPath === undefined) {
+    return undefined;
+  }
+  return loadGuwahDownstreamTransportConfig(options.configPath);
+}
+
+export type GuwahDownstreamConnection = {
+  readonly client: Client;
+  readonly transport: StdioClientTransport;
+  readonly config: GuwahDownstreamTransportConfig;
+  /**
+   * False after process exit, EOF, or protocol death.
+   * A stale (dead) connection must never be treated as healthy.
+   */
+  readonly isHealthy: () => boolean;
+  /**
+   * Fail closed for subsequent work when the downstream is dead.
+   */
+  readonly assertHealthy: () => void;
+};
+
+/**
+ * Spawns/connects the official MCP downstream client using local transport config.
+ * Connection failure is explicit and fail-closed. There is no automatic retry and no
+ * silent success after a failed spawn or handshake.
+ * After connect, exit/EOF/protocol death marks the connection dead fail-closed.
+ * Automatic provider failover is not performed.
+ */
+export async function connectGuwahDownstream(
+  config: GuwahDownstreamTransportConfig,
+  options?: {
+    readonly client?: Client;
+    readonly onDead?: () => void;
+  },
+): Promise<GuwahDownstreamConnection> {
+  if (config.transport !== "stdio") {
+    throw new Error(GUWAH_DOWNSTREAM_CONNECTION_ERROR);
+  }
+
+  const client = options?.client ?? createGuwahDownstreamClient();
+  const transportOptions: {
+    command: string;
+    args?: string[];
+    cwd?: string;
+    stderr: "pipe";
+  } = {
+    command: config.command,
+    stderr: "pipe",
+  };
+  if (config.args !== undefined) {
+    transportOptions.args = [...config.args];
+  }
+  if (config.cwd !== undefined) {
+    transportOptions.cwd = config.cwd;
+  }
+
+  let transport: StdioClientTransport;
+  try {
+    transport = new StdioClientTransport(transportOptions);
+  } catch {
+    throw new Error(GUWAH_DOWNSTREAM_CONNECTION_ERROR);
+  }
+
+  try {
+    // Single attempt only: non-mutating retries are not performed automatically.
+    await client.connect(transport);
+  } catch {
+    try {
+      await client.close();
+    } catch {
+      // Best-effort cleanup after an explicit connect failure.
+    }
+    try {
+      await transport.close();
+    } catch {
+      // Best-effort cleanup after an explicit connect failure.
+    }
+    throw new Error(GUWAH_DOWNSTREAM_CONNECTION_ERROR);
+  }
+
+  let healthy = true;
+  const markDead = (): void => {
+    if (!healthy) {
+      return;
+    }
+    // Exit, EOF, and protocol death all seal the connection; no failover reconnect.
+    healthy = false;
+    options?.onDead?.();
+  };
+
+  const priorOnClose = transport.onclose;
+  transport.onclose = () => {
+    // Child exit or stdin EOF closes the transport.
+    markDead();
+    priorOnClose?.();
+  };
+  const priorOnError = transport.onerror;
+  transport.onerror = (error: Error) => {
+    // Protocol death / transport fault.
+    markDead();
+    priorOnError?.(error);
+  };
+
+  return {
+    client,
+    transport,
+    config,
+    isHealthy: () => healthy,
+    assertHealthy: () => {
+      if (!healthy) {
+        throw new Error(GUWAH_DOWNSTREAM_CONNECTION_DEAD_ERROR);
+      }
+    },
+  };
+}
+
+/**
  * Builds the MCP gateway server.
  * `initialize` and `initialized` are handled by the official SDK Server.
  * Advertised capabilities are limited to surfaces the gateway actually mediates.
  * tools/list returns only the authorized mediated set.
  * tools/call runs GuwahGuard.validateToolCall before any downstream send.
+ * Only tools/call may execute tools; other methods must not smuggle dispatch.
  * MCP cancellation suppresses late success for cancelled in-flight calls.
  * Optional per-request deadlines expire fail-closed without automatic retry.
  * Late results after cancel, deadline expiry, or shutdown abort are dropped.
@@ -847,7 +1110,21 @@ function resolveShutdownGraceMs(value: number | undefined): number {
  */
 export async function startGuwahStdioGateway(
   options?: GuwahStdioGatewayOptions,
-): Promise<{ readonly server: Server; readonly transport: StdioServerTransport }> {
+): Promise<{
+  readonly server: Server;
+  readonly transport: StdioServerTransport;
+  readonly downstream?: GuwahDownstreamConnection;
+}> {
+  // Missing path => deny-all (no implicit localhost). Provided path must validate and connect.
+  let downstreamConnection: GuwahDownstreamConnection | undefined;
+  if (options?.downstreamTransportConfigPath !== undefined) {
+    const downstreamConfig = loadGuwahDownstreamTransportConfig(
+      options.downstreamTransportConfigPath,
+    );
+    // Failed connect must not proceed to a tool-exposing gateway server.
+    downstreamConnection = await connectGuwahDownstream(downstreamConfig);
+  }
+
   const stdinStream = options?.stdin ?? process.stdin;
   const stdoutStream = options?.stdout ?? process.stdout;
   const shutdownGraceMs = resolveShutdownGraceMs(options?.shutdownGraceMs);
@@ -921,11 +1198,26 @@ export async function startGuwahStdioGateway(
       if (!acceptingNewMessages) {
         throw new McpError(ErrorCode.InternalError, "Gateway is shutting down.");
       }
+      if (downstreamConnection !== undefined) {
+        // Dead/stale downstream must fail closed for subsequent calls; no failover.
+        try {
+          downstreamConnection.assertHealthy();
+        } catch {
+          throw new McpError(ErrorCode.InternalError, GUWAH_DOWNSTREAM_CONNECTION_DEAD_ERROR);
+        }
+      }
       activeDispatches += 1;
       try {
         // Re-check after booking the slot so shutdown cannot sneak a second dispatch.
         if (!acceptingNewMessages) {
           throw new McpError(ErrorCode.InternalError, "Gateway is shutting down.");
+        }
+        if (downstreamConnection !== undefined) {
+          try {
+            downstreamConnection.assertHealthy();
+          } catch {
+            throw new McpError(ErrorCode.InternalError, GUWAH_DOWNSTREAM_CONNECTION_DEAD_ERROR);
+          }
         }
         return await userAfterApproval(approved);
       } finally {
@@ -985,6 +1277,18 @@ export async function startGuwahStdioGateway(
       await transport.close();
     } catch {
       // Cleanup must not throw into the transport loop.
+    }
+    if (downstreamConnection !== undefined) {
+      try {
+        await downstreamConnection.client.close();
+      } catch {
+        // Cleanup must not throw into the transport loop.
+      }
+      try {
+        await downstreamConnection.transport.close();
+      } catch {
+        // Cleanup must not throw into the transport loop.
+      }
     }
   };
 
@@ -1090,7 +1394,10 @@ export async function startGuwahStdioGateway(
     }
   }) as typeof transport.send;
 
-  return { server, transport };
+  if (downstreamConnection === undefined) {
+    return { server, transport };
+  }
+  return { server, transport, downstream: downstreamConnection };
 }
 
 function isGatewayEntry(): boolean {

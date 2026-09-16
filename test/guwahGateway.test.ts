@@ -11,17 +11,26 @@ import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import {
+  connectGuwahDownstream,
+  createGuwahDownstreamClient,
   createGuwahGatewayServer,
   createGuwahStdioTransport,
   formatGuwahDiagnosticLine,
   GuwahActiveRequestRegistry,
+  GUWAH_DOWNSTREAM_CLIENT_NAME,
+  GUWAH_DOWNSTREAM_CLIENT_VERSION,
+  GUWAH_DOWNSTREAM_CONNECTION_DEAD_ERROR,
+  GUWAH_DOWNSTREAM_CONNECTION_ERROR,
+  GUWAH_DOWNSTREAM_TRANSPORT_CONFIG_ERROR,
   GUWAH_GATEWAY_CAPABILITIES,
   GUWAH_GATEWAY_NAME,
   GUWAH_GATEWAY_VERSION,
   GUWAH_STDIO_BACKPRESSURE_BOUNDS,
   GUWAH_VIOLATION_MCP_MAP,
+  loadGuwahDownstreamTransportConfig,
   mapGuwahViolationToMcpError,
   redactGuwahDiagnosticText,
+  resolveGuwahDownstreamTransportConfig,
   startGuwahStdioGateway,
   writeGuwahStderrDiagnostic,
   type GuwahMediatedTool,
@@ -181,6 +190,513 @@ describe("guwahGateway entry", () => {
   });
 });
 
+describe("official MCP downstream client", () => {
+  it("constructs the official SDK client for the gateway process", () => {
+    const client = createGuwahDownstreamClient();
+    expect(client).toBeInstanceOf(Client);
+    expect(GUWAH_DOWNSTREAM_CLIENT_NAME).toBe("guwah-downstream");
+    expect(GUWAH_DOWNSTREAM_CLIENT_VERSION).toBe(GUWAH_GATEWAY_VERSION);
+  });
+
+  it("fails closed on invalid construction inputs without an open-proxy substitute", () => {
+    expect(() => createGuwahDownstreamClient({ name: "   " })).toThrow(
+      "Downstream MCP client construction failed.",
+    );
+    expect(() => createGuwahDownstreamClient({ version: "" })).toThrow(
+      "Downstream MCP client construction failed.",
+    );
+  });
+
+  it("keeps client imports out of the validator and limited to the gateway module", () => {
+    const validator = readFileSync(path.join(REPO_ROOT, "src", "guwahGuard.ts"), "utf8");
+    const adapter = readFileSync(path.join(REPO_ROOT, "src", "guwahMcpAdapter.ts"), "utf8");
+    const gateway = readFileSync(GATEWAY_SOURCE, "utf8");
+
+    expect(validator).not.toMatch(/@modelcontextprotocol/);
+    expect(validator).not.toMatch(/sdk\/client/);
+    expect(adapter).not.toMatch(/sdk\/client/);
+    expect(gateway).toMatch(/@modelcontextprotocol\/sdk\/client\/index\.js/);
+    expect(gateway).toMatch(/export function createGuwahDownstreamClient/);
+    expect(gateway).toMatch(/Fail closed: do not return a passthrough or unofficial substitute/);
+  });
+});
+
+describe("downstream transport configuration", () => {
+  const configDirs: string[] = [];
+
+  afterEach(() => {
+    for (const dir of configDirs.splice(0, configDirs.length)) {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  function writeConfig(document: unknown): string {
+    const dir = mkdtempSync(path.join(tmpdir(), "guwah-downstream-transport-"));
+    configDirs.push(dir);
+    const configPath = path.join(dir, "downstream-transport.json");
+    writeFileSync(configPath, `${JSON.stringify(document, null, 2)}\n`, "utf8");
+    return configPath;
+  }
+
+  it("loads a valid local stdio spawn configuration", () => {
+    const configPath = writeConfig({
+      transport: "stdio",
+      command: process.execPath,
+      args: ["-e", "process.exit(0)"],
+      cwd: REPO_ROOT,
+    });
+    const loaded = loadGuwahDownstreamTransportConfig(configPath);
+    expect(loaded).toEqual({
+      transport: "stdio",
+      command: process.execPath,
+      args: ["-e", "process.exit(0)"],
+      cwd: REPO_ROOT,
+    });
+    expect(Object.isFrozen(loaded)).toBe(true);
+  });
+
+  it("defaults to deny-all when no config path is provided", () => {
+    expect(resolveGuwahDownstreamTransportConfig()).toBeUndefined();
+    expect(resolveGuwahDownstreamTransportConfig({})).toBeUndefined();
+    const gateway = readFileSync(GATEWAY_SOURCE, "utf8");
+    expect(gateway).toMatch(/no implicit localhost/);
+    expect(gateway).not.toMatch(/transport:\s*"stdio",\s*command:\s*"localhost"/);
+  });
+
+  it("rejects a missing configuration file", () => {
+    const missing = path.join(tmpdir(), "guwah-downstream-missing", "absent.json");
+    expect(() => loadGuwahDownstreamTransportConfig(missing)).toThrow(
+      GUWAH_DOWNSTREAM_TRANSPORT_CONFIG_ERROR,
+    );
+  });
+
+  it("rejects invalid configuration documents", () => {
+    const cases: unknown[] = [
+      { transport: "http", command: process.execPath },
+      { transport: "sse", command: process.execPath },
+      { transport: "stdio" },
+      { transport: "stdio", command: "   " },
+      { transport: "stdio", command: process.execPath, args: [1] },
+      { transport: "stdio", command: process.execPath, unexpected: true },
+      { transport: "stdio", command: process.execPath, cwd: "" },
+      "stdio",
+      null,
+    ];
+    for (const document of cases) {
+      const configPath = writeConfig(document);
+      expect(() => loadGuwahDownstreamTransportConfig(configPath)).toThrow(
+        GUWAH_DOWNSTREAM_TRANSPORT_CONFIG_ERROR,
+      );
+    }
+    const dir = mkdtempSync(path.join(tmpdir(), "guwah-downstream-bad-json-"));
+    configDirs.push(dir);
+    const badJsonPath = path.join(dir, "broken.json");
+    writeFileSync(badJsonPath, "{not-json\n", "utf8");
+    expect(() => loadGuwahDownstreamTransportConfig(badJsonPath)).toThrow(
+      GUWAH_DOWNSTREAM_TRANSPORT_CONFIG_ERROR,
+    );
+  });
+
+  it("prevents gateway startup when a provided config path is invalid", async () => {
+    const configPath = writeConfig({ transport: "stdio" });
+    let dispatchCount = 0;
+    await expect(
+      startGuwahStdioGateway({
+        stdin: new PassThrough(),
+        stdout: new PassThrough(),
+        downstreamTransportConfigPath: configPath,
+        afterApproval: async () => {
+          dispatchCount += 1;
+          return { content: [{ type: "text", text: "should-not-run" }] };
+        },
+      }),
+    ).rejects.toThrow(GUWAH_DOWNSTREAM_TRANSPORT_CONFIG_ERROR);
+    expect(dispatchCount).toBe(0);
+  });
+
+  it("does not expose tools from an implicit localhost default", async () => {
+    expect(resolveGuwahDownstreamTransportConfig()).toBeUndefined();
+    const server = createGuwahGatewayServer();
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    const client = new Client({ name: "guwah-deny-all-default", version: "0.0.0" });
+    await server.connect(serverTransport);
+    await client.connect(clientTransport);
+    const listed = await client.listTools();
+    expect(listed.tools).toEqual([]);
+    await client.close();
+    await server.close();
+  });
+});
+
+describe("downstream connection", () => {
+  const configDirs: string[] = [];
+  const liveDownstream: Array<{ client: Client; transport: StdioClientTransport }> = [];
+
+  afterEach(async () => {
+    for (const entry of liveDownstream.splice(0, liveDownstream.length)) {
+      try {
+        await entry.client.close();
+      } catch {
+        // Test cleanup.
+      }
+      try {
+        await entry.transport.close();
+      } catch {
+        // Test cleanup.
+      }
+    }
+    for (const dir of configDirs.splice(0, configDirs.length)) {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  function writeConfig(document: unknown): string {
+    const dir = mkdtempSync(path.join(tmpdir(), "guwah-downstream-connect-"));
+    configDirs.push(dir);
+    const configPath = path.join(dir, "downstream-transport.json");
+    writeFileSync(configPath, `${JSON.stringify(document, null, 2)}\n`, "utf8");
+    return configPath;
+  }
+
+  it("connects to a configured stdio downstream MCP server", async () => {
+    expect(existsSync(GATEWAY_ENTRY)).toBe(true);
+    const connection = await connectGuwahDownstream({
+      transport: "stdio",
+      command: process.execPath,
+      args: [GATEWAY_ENTRY],
+      cwd: REPO_ROOT,
+    });
+    liveDownstream.push({ client: connection.client, transport: connection.transport });
+    expect(connection.client.getServerVersion()).toEqual({
+      name: GUWAH_GATEWAY_NAME,
+      version: GUWAH_GATEWAY_VERSION,
+    });
+  });
+
+  it("fails closed for a missing command and exposes no tools", async () => {
+    const missingCommand = path.join(
+      tmpdir(),
+      "guwah-missing-downstream-cmd",
+      "no-such-guwah-downstream-binary",
+    );
+    expect(existsSync(missingCommand)).toBe(false);
+
+    await expect(
+      connectGuwahDownstream({
+        transport: "stdio",
+        command: missingCommand,
+      }),
+    ).rejects.toThrow(GUWAH_DOWNSTREAM_CONNECTION_ERROR);
+
+    const configPath = writeConfig({
+      transport: "stdio",
+      command: missingCommand,
+    });
+    const mediatedLeak: GuwahMediatedTool = {
+      name: "should-not-be-exposed",
+      inputSchema: {
+        type: "object",
+        additionalProperties: false,
+        properties: {},
+      },
+    };
+    let gatewayStarted = false;
+    await expect(
+      startGuwahStdioGateway({
+        stdin: new PassThrough(),
+        stdout: new PassThrough(),
+        downstreamTransportConfigPath: configPath,
+        mediatedTools: [mediatedLeak],
+        afterApproval: async () => {
+          gatewayStarted = true;
+          return { content: [{ type: "text", text: "should-not-run" }] };
+        },
+      }),
+    ).rejects.toThrow(GUWAH_DOWNSTREAM_CONNECTION_ERROR);
+    expect(gatewayStarted).toBe(false);
+
+    // A standalone deny-all gateway still lists no tools when connect never succeeds.
+    const server = createGuwahGatewayServer({ mediatedTools: [] });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    const client = new Client({ name: "guwah-connect-fail-tools", version: "0.0.0" });
+    await server.connect(serverTransport);
+    await client.connect(clientTransport);
+    expect((await client.listTools()).tools).toEqual([]);
+    await client.close();
+    await server.close();
+  });
+
+  it("does not automatically retry a failed connection into a silent success", () => {
+    const source = readFileSync(GATEWAY_SOURCE, "utf8");
+    expect(source).toMatch(/Single attempt only/);
+    expect(source).toMatch(/no automatic retry/);
+    expect(source).not.toMatch(/for\s*\(.*retry/i);
+  });
+});
+
+describe("downstream connection health", () => {
+  const configDirs: string[] = [];
+  const liveDownstream: Array<{ client: Client; transport: StdioClientTransport }> = [];
+
+  afterEach(async () => {
+    for (const entry of liveDownstream.splice(0, liveDownstream.length)) {
+      try {
+        await entry.client.close();
+      } catch {
+        // Test cleanup.
+      }
+      try {
+        await entry.transport.close();
+      } catch {
+        // Test cleanup.
+      }
+    }
+    for (const dir of configDirs.splice(0, configDirs.length)) {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  function writeConfig(document: unknown): string {
+    const dir = mkdtempSync(path.join(tmpdir(), "guwah-downstream-health-"));
+    configDirs.push(dir);
+    const configPath = path.join(dir, "downstream-transport.json");
+    writeFileSync(configPath, `${JSON.stringify(document, null, 2)}\n`, "utf8");
+    return configPath;
+  }
+
+  async function waitUntilUnhealthy(
+    isHealthy: () => boolean,
+    timeoutMs: number,
+  ): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline && isHealthy()) {
+      await new Promise((resolve) => {
+        setTimeout(resolve, 25);
+      });
+    }
+  }
+
+  it("marks a killed downstream as dead and fails closed for subsequent calls", async () => {
+    expect(existsSync(GATEWAY_ENTRY)).toBe(true);
+    const connection = await connectGuwahDownstream({
+      transport: "stdio",
+      command: process.execPath,
+      args: [GATEWAY_ENTRY],
+      cwd: REPO_ROOT,
+    });
+    liveDownstream.push({ client: connection.client, transport: connection.transport });
+    expect(connection.isHealthy()).toBe(true);
+    connection.assertHealthy();
+
+    const pid = connection.transport.pid;
+    expect(pid).not.toBeNull();
+    if (pid === null) {
+      expect.unreachable("downstream pid");
+    }
+    process.kill(pid);
+
+    await waitUntilUnhealthy(connection.isHealthy, 5000);
+    expect(connection.isHealthy()).toBe(false);
+    expect(() => connection.assertHealthy()).toThrow(GUWAH_DOWNSTREAM_CONNECTION_DEAD_ERROR);
+    // Stale connection must not be treated as healthy after death.
+    expect(connection.isHealthy()).toBe(false);
+  });
+
+  it("fails closed for subsequent gateway calls after the downstream is killed", async () => {
+    expect(existsSync(GATEWAY_ENTRY)).toBe(true);
+    const configPath = writeConfig({
+      transport: "stdio",
+      command: process.execPath,
+      args: [GATEWAY_ENTRY],
+      cwd: REPO_ROOT,
+    });
+
+    const TOOL_NAME = "coinbase_cdp_transfer";
+    const WHITELISTED_DESTINATION = "0x1111111111111111111111111111111111111111";
+    const policyDir = mkdtempSync(path.join(tmpdir(), "guwah-downstream-health-policy-"));
+    configDirs.push(policyDir);
+    const policyPath = path.join(policyDir, "guwah-policy.json");
+    writeFileSync(
+      policyPath,
+      `${JSON.stringify(
+        {
+          version: "1.0.0",
+          posture: "default-deny",
+          tools: {
+            [TOOL_NAME]: {
+              action: "ENFORCE",
+              argsSchema: {
+                $schema: "http://json-schema.org/draft-07/schema#",
+                type: "object",
+                additionalProperties: false,
+                required: ["amountMinor", "assetId", "destinationAddress", "memo"],
+                properties: {
+                  amountMinor: { type: "integer", minimum: 1, maximum: 5000 },
+                  assetId: { type: "string", enum: ["USDC"] },
+                  destinationAddress: {
+                    type: "string",
+                    pattern: "^0x[0-9a-fA-F]{40}$",
+                    enum: [WHITELISTED_DESTINATION],
+                  },
+                  memo: {
+                    type: "string",
+                    minLength: 1,
+                    maxLength: 80,
+                    pattern: "^[A-Za-z0-9 .,_:-]+$",
+                  },
+                },
+              },
+            },
+          },
+        },
+        null,
+        2,
+      )}\n`,
+      "utf8",
+    );
+
+    const mediatedTransfer: GuwahMediatedTool = {
+      name: TOOL_NAME,
+      inputSchema: {
+        type: "object",
+        additionalProperties: false,
+        required: ["amountMinor", "assetId", "destinationAddress", "memo"],
+        properties: {
+          amountMinor: { type: "integer" },
+          assetId: { type: "string" },
+          destinationAddress: { type: "string" },
+          memo: { type: "string" },
+        },
+      },
+    };
+
+    let dispatchCount = 0;
+    const stdin = new PassThrough();
+    const stdout = new PassThrough();
+    const chunks: string[] = [];
+    stdout.setEncoding("utf8");
+    stdout.on("data", (chunk: string) => {
+      chunks.push(chunk);
+    });
+
+    const { server, downstream } = await startGuwahStdioGateway({
+      stdin,
+      stdout,
+      policyPath,
+      mediatedTools: [mediatedTransfer],
+      downstreamTransportConfigPath: configPath,
+      afterApproval: async () => {
+        dispatchCount += 1;
+        return { content: [{ type: "text", text: "should-not-dispatch-after-death" }] };
+      },
+    });
+    expect(downstream).toBeDefined();
+    if (downstream === undefined) {
+      expect.unreachable("downstream");
+    }
+    liveDownstream.push({ client: downstream.client, transport: downstream.transport });
+    expect(downstream.isHealthy()).toBe(true);
+
+    stdin.write(
+      `${JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "initialize",
+        params: {
+          protocolVersion: "2025-11-25",
+          capabilities: {},
+          clientInfo: { name: "guwah-health-kill", version: "0.0.0" },
+        },
+      })}\n`,
+    );
+    const initDeadline = Date.now() + 5000;
+    while (Date.now() < initDeadline && chunks.join("").trim().length === 0) {
+      await new Promise((resolve) => {
+        setTimeout(resolve, 25);
+      });
+    }
+    stdin.write(`${JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" })}\n`);
+
+    const pid = downstream.transport.pid;
+    expect(pid).not.toBeNull();
+    if (pid === null) {
+      expect.unreachable("downstream pid");
+    }
+    process.kill(pid);
+    await waitUntilUnhealthy(downstream.isHealthy, 5000);
+    expect(downstream.isHealthy()).toBe(false);
+
+    stdin.write(
+      `${JSON.stringify({
+        jsonrpc: "2.0",
+        id: 2,
+        method: "tools/call",
+        params: {
+          name: TOOL_NAME,
+          arguments: {
+            amountMinor: 5000,
+            assetId: "USDC",
+            destinationAddress: WHITELISTED_DESTINATION,
+            memo: "invoice 1001",
+          },
+        },
+      })}\n`,
+    );
+    const callDeadline = Date.now() + 5000;
+    while (
+      Date.now() < callDeadline &&
+      chunks.join("").split(/\r?\n/).filter((line) => line.length > 0).length < 2
+    ) {
+      await new Promise((resolve) => {
+        setTimeout(resolve, 25);
+      });
+    }
+
+    expect(dispatchCount).toBe(0);
+    expect(chunks.join("")).not.toContain("should-not-dispatch-after-death");
+    const frames = chunks
+      .join("")
+      .split(/\r?\n/)
+      .filter((line) => line.length > 0)
+      .map((line) => JSON.parse(line) as Record<string, unknown>);
+    const callResponse = frames.find((frame) => frame.id === 2);
+    expect(callResponse).toMatchObject({
+      jsonrpc: "2.0",
+      id: 2,
+      error: expect.objectContaining({
+        code: -32603,
+        message: expect.stringContaining(GUWAH_DOWNSTREAM_CONNECTION_DEAD_ERROR),
+      }),
+    });
+    expect(callResponse).not.toHaveProperty("result");
+    expect(downstream.isHealthy()).toBe(false);
+
+    await server.close().catch(() => undefined);
+  });
+
+  it("treats protocol death as an unhealthy connection", async () => {
+    expect(existsSync(GATEWAY_ENTRY)).toBe(true);
+    const connection = await connectGuwahDownstream({
+      transport: "stdio",
+      command: process.execPath,
+      args: [GATEWAY_ENTRY],
+      cwd: REPO_ROOT,
+    });
+    liveDownstream.push({ client: connection.client, transport: connection.transport });
+    expect(connection.isHealthy()).toBe(true);
+
+    connection.transport.onerror?.(new Error("protocol death fixture"));
+    expect(connection.isHealthy()).toBe(false);
+    expect(() => connection.assertHealthy()).toThrow(GUWAH_DOWNSTREAM_CONNECTION_DEAD_ERROR);
+  });
+
+  it("does not implement automatic provider failover", () => {
+    const source = readFileSync(GATEWAY_SOURCE, "utf8");
+    expect(source).toMatch(/no failover/);
+    expect(source).not.toMatch(/reconnectGuwahDownstream|automatic failover/i);
+  });
+});
+
 describe("gateway start", () => {
   it("starts the compiled gateway process over stdio", async () => {
     expect(existsSync(GATEWAY_ENTRY)).toBe(true);
@@ -311,10 +827,16 @@ describe("MCP initialization handshake", () => {
 
   it("rejects malformed initialize and performs no downstream work", async () => {
     const gatewaySource = readFileSync(GATEWAY_SOURCE, "utf8");
-    expect(gatewaySource).not.toMatch(/sdk\/client/);
+    expect(gatewaySource).toMatch(/This factory does not open a downstream client by default/);
     expect(gatewaySource).not.toMatch(/fetch\(/);
     expect(gatewaySource).not.toMatch(/\bnet\./);
     expect(gatewaySource).not.toMatch(/\bhttp\./);
+    const serverFactoryStart = gatewaySource.indexOf("export function createGuwahGatewayServer");
+    const serverFactoryEnd = gatewaySource.indexOf("export const GUWAH_STDIO_BACKPRESSURE_BOUNDS");
+    expect(serverFactoryStart).toBeGreaterThan(-1);
+    expect(serverFactoryEnd).toBeGreaterThan(serverFactoryStart);
+    const serverFactory = gatewaySource.slice(serverFactoryStart, serverFactoryEnd);
+    expect(serverFactory).not.toMatch(/createGuwahDownstreamClient\(/);
 
     const server = createGuwahGatewayServer();
     let initialized = false;
@@ -1843,6 +2365,254 @@ describe("stdio invalid-request transport", () => {
 
     await server.close().catch(() => undefined);
     await transport.close().catch(() => undefined);
+  });
+});
+
+describe("stdio unsupported-method transport", () => {
+  const TOOL_NAME = "coinbase_cdp_transfer";
+  const WHITELISTED_DESTINATION = "0x1111111111111111111111111111111111111111";
+
+  const INITIALIZE_FIXTURE = {
+    jsonrpc: "2.0" as const,
+    id: 1,
+    method: "initialize",
+    params: {
+      protocolVersion: "2025-11-25",
+      capabilities: {},
+      clientInfo: { name: "guwah-stdio-unsupported-method-fixture", version: "0.0.0" },
+    },
+  };
+
+  const TRANSFER_SCHEMA = {
+    $schema: "http://json-schema.org/draft-07/schema#",
+    type: "object",
+    additionalProperties: false,
+    required: ["amountMinor", "assetId", "destinationAddress", "memo"],
+    properties: {
+      amountMinor: { type: "integer", minimum: 1, maximum: 5000 },
+      assetId: { type: "string", enum: ["USDC"] },
+      destinationAddress: {
+        type: "string",
+        pattern: "^0x[0-9a-fA-F]{40}$",
+        enum: [WHITELISTED_DESTINATION],
+      },
+      memo: {
+        type: "string",
+        minLength: 1,
+        maxLength: 80,
+        pattern: "^[A-Za-z0-9 .,_:-]+$",
+      },
+    },
+  } as const;
+
+  const mediatedTransfer: GuwahMediatedTool = {
+    name: TOOL_NAME,
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      required: ["amountMinor", "assetId", "destinationAddress", "memo"],
+      properties: {
+        amountMinor: { type: "integer" },
+        assetId: { type: "string" },
+        destinationAddress: { type: "string" },
+        memo: { type: "string" },
+      },
+    },
+  };
+
+  function compliantArgs(): Record<string, unknown> {
+    return {
+      amountMinor: 5000,
+      assetId: "USDC",
+      destinationAddress: WHITELISTED_DESTINATION,
+      memo: "invoice 1001",
+    };
+  }
+
+  const policyDirs: string[] = [];
+
+  afterEach(() => {
+    for (const dir of policyDirs.splice(0, policyDirs.length)) {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  function writePolicy(): string {
+    const dir = mkdtempSync(path.join(tmpdir(), "guwah-stdio-unsupported-method-"));
+    policyDirs.push(dir);
+    const policyPath = path.join(dir, "guwah-policy.json");
+    writeFileSync(
+      policyPath,
+      `${JSON.stringify(
+        {
+          version: "1.0.0",
+          posture: "default-deny",
+          tools: {
+            [TOOL_NAME]: {
+              action: "ENFORCE",
+              argsSchema: structuredClone(TRANSFER_SCHEMA),
+            },
+          },
+        },
+        null,
+        2,
+      )}\n`,
+      "utf8",
+    );
+    return policyPath;
+  }
+
+  async function completeInitialize(stdin: PassThrough, chunks: string[]): Promise<void> {
+    stdin.write(`${JSON.stringify(INITIALIZE_FIXTURE)}\n`);
+    const initDeadline = Date.now() + 5000;
+    while (Date.now() < initDeadline && chunks.join("").trim().length === 0) {
+      await new Promise((resolve) => {
+        setTimeout(resolve, 25);
+      });
+    }
+    stdin.write(`${JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" })}\n`);
+  }
+
+  it("rejects an unknown method over stdio without dispatch", async () => {
+    const policyPath = writePolicy();
+    let dispatchCount = 0;
+    const stdin = new PassThrough();
+    const stdout = new PassThrough();
+    const chunks: string[] = [];
+    stdout.setEncoding("utf8");
+    stdout.on("data", (chunk: string) => {
+      chunks.push(chunk);
+    });
+
+    const { server } = await startGuwahStdioGateway({
+      stdin,
+      stdout,
+      policyPath,
+      mediatedTools: [mediatedTransfer],
+      afterApproval: async () => {
+        dispatchCount += 1;
+        return { content: [{ type: "text", text: "should-not-dispatch" }] };
+      },
+      onTransportFailure: () => {
+        throw new Error("unexpected transport failure during unsupported-method fixture");
+      },
+    });
+
+    await completeInitialize(stdin, chunks);
+    stdin.write(
+      `${JSON.stringify({
+        jsonrpc: "2.0",
+        id: 2,
+        method: "provider/secretExecute",
+        params: {
+          name: TOOL_NAME,
+          arguments: compliantArgs(),
+        },
+      })}\n`,
+    );
+
+    const callDeadline = Date.now() + 5000;
+    while (
+      Date.now() < callDeadline &&
+      chunks.join("").split(/\r?\n/).filter((line) => line.length > 0).length < 2
+    ) {
+      await new Promise((resolve) => {
+        setTimeout(resolve, 25);
+      });
+    }
+
+    expect(dispatchCount).toBe(0);
+    expect(chunks.join("")).not.toContain("should-not-dispatch");
+    const frames = chunks
+      .join("")
+      .split(/\r?\n/)
+      .filter((line) => line.length > 0)
+      .map((line) => JSON.parse(line) as Record<string, unknown>);
+    const methodResponse = frames.find((frame) => frame.id === 2);
+    expect(methodResponse).toMatchObject({
+      jsonrpc: "2.0",
+      id: 2,
+      error: expect.objectContaining({
+        code: -32601,
+      }),
+    });
+    expect(methodResponse).not.toHaveProperty("result");
+
+    await server.close();
+  });
+
+  it("cannot smuggle a tools/call payload through an unsupported stdio method", async () => {
+    const policyPath = writePolicy();
+    let dispatchCount = 0;
+    const stdin = new PassThrough();
+    const stdout = new PassThrough();
+    const chunks: string[] = [];
+    stdout.setEncoding("utf8");
+    stdout.on("data", (chunk: string) => {
+      chunks.push(chunk);
+    });
+
+    const { server } = await startGuwahStdioGateway({
+      stdin,
+      stdout,
+      policyPath,
+      mediatedTools: [mediatedTransfer],
+      afterApproval: async () => {
+        dispatchCount += 1;
+        return { content: [{ type: "text", text: "smuggled-dispatch" }] };
+      },
+      onTransportFailure: () => {
+        throw new Error("unexpected transport failure during smuggle fixture");
+      },
+    });
+
+    await completeInitialize(stdin, chunks);
+    stdin.write(
+      `${JSON.stringify({
+        jsonrpc: "2.0",
+        id: 2,
+        method: "tools/execute",
+        params: {
+          jsonrpc: "2.0",
+          method: "tools/call",
+          name: TOOL_NAME,
+          arguments: compliantArgs(),
+          params: {
+            name: TOOL_NAME,
+            arguments: compliantArgs(),
+          },
+        },
+      })}\n`,
+    );
+
+    const callDeadline = Date.now() + 5000;
+    while (
+      Date.now() < callDeadline &&
+      chunks.join("").split(/\r?\n/).filter((line) => line.length > 0).length < 2
+    ) {
+      await new Promise((resolve) => {
+        setTimeout(resolve, 25);
+      });
+    }
+
+    expect(dispatchCount).toBe(0);
+    expect(chunks.join("")).not.toContain("smuggled-dispatch");
+    const frames = chunks
+      .join("")
+      .split(/\r?\n/)
+      .filter((line) => line.length > 0)
+      .map((line) => JSON.parse(line) as Record<string, unknown>);
+    const methodResponse = frames.find((frame) => frame.id === 2);
+    expect(methodResponse).toMatchObject({
+      jsonrpc: "2.0",
+      id: 2,
+      error: expect.objectContaining({
+        code: -32601,
+      }),
+    });
+    expect(methodResponse).not.toHaveProperty("result");
+
+    await server.close();
   });
 });
 
@@ -5938,6 +6708,532 @@ describe("validate before dispatch", () => {
 
     await server.close();
     await clientTransport.close();
+  });
+});
+
+describe("complete call envelope", () => {
+  const TOOL_NAME = "coinbase_cdp_transfer";
+  const WHITELISTED_DESTINATION = "0x1111111111111111111111111111111111111111";
+
+  const TRANSFER_SCHEMA = {
+    $schema: "http://json-schema.org/draft-07/schema#",
+    type: "object",
+    additionalProperties: false,
+    required: ["amountMinor", "assetId", "destinationAddress", "memo"],
+    properties: {
+      amountMinor: { type: "integer", minimum: 1, maximum: 5000 },
+      assetId: { type: "string", enum: ["USDC"] },
+      destinationAddress: {
+        type: "string",
+        pattern: "^0x[0-9a-fA-F]{40}$",
+        enum: [
+          "0x1111111111111111111111111111111111111111",
+          "0x2222222222222222222222222222222222222222",
+        ],
+      },
+      memo: {
+        type: "string",
+        minLength: 1,
+        maxLength: 80,
+        pattern: "^[A-Za-z0-9 .,_:-]+$",
+      },
+    },
+  } as const;
+
+  const mediatedTransfer: GuwahMediatedTool = {
+    name: TOOL_NAME,
+    description: "Gateway-mediated fake transfer",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      required: ["amountMinor", "assetId", "destinationAddress", "memo"],
+      properties: {
+        amountMinor: { type: "integer" },
+        assetId: { type: "string" },
+        destinationAddress: { type: "string" },
+        memo: { type: "string" },
+      },
+    },
+  };
+
+  function transferPolicy(): Record<string, unknown> {
+    return {
+      version: "1.0.0",
+      posture: "default-deny",
+      tools: {
+        [TOOL_NAME]: {
+          action: "ENFORCE",
+          argsSchema: structuredClone(TRANSFER_SCHEMA),
+        },
+      },
+    };
+  }
+
+  function compliantArgs(): Record<string, unknown> {
+    return {
+      amountMinor: 5000,
+      assetId: "USDC",
+      destinationAddress: WHITELISTED_DESTINATION,
+      memo: "invoice 1001",
+    };
+  }
+
+  const policyDirs: string[] = [];
+
+  afterEach(() => {
+    for (const dir of policyDirs.splice(0, policyDirs.length)) {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  function writePolicy(): string {
+    const dir = mkdtempSync(path.join(tmpdir(), "guwah-gateway-envelope-"));
+    policyDirs.push(dir);
+    const policyPath = path.join(dir, "guwah-policy.json");
+    writeFileSync(policyPath, `${JSON.stringify(transferPolicy(), null, 2)}\n`, "utf8");
+    return policyPath;
+  }
+
+  async function initializePair(
+    server: ReturnType<typeof createGuwahGatewayServer>,
+  ): Promise<{
+    clientTransport: ReturnType<typeof InMemoryTransport.createLinkedPair>[0];
+    responses: unknown[];
+  }> {
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await server.connect(serverTransport);
+    await clientTransport.start();
+
+    const responses: unknown[] = [];
+    clientTransport.onmessage = (message) => {
+      responses.push(message);
+    };
+
+    await clientTransport.send({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "initialize",
+      params: {
+        protocolVersion: "2025-11-25",
+        capabilities: {},
+        clientInfo: { name: "guwah-complete-envelope", version: "0.0.0" },
+      },
+    });
+    const initDeadline = Date.now() + 5000;
+    while (Date.now() < initDeadline && responses.length === 0) {
+      await new Promise((resolve) => {
+        setTimeout(resolve, 25);
+      });
+    }
+    await clientTransport.send({
+      jsonrpc: "2.0",
+      method: "notifications/initialized",
+    });
+    return { clientTransport, responses };
+  }
+
+  it("keeps GuwahGuard as the enforcement engine for the complete envelope", async () => {
+    const policyPath = writePolicy();
+    const guard = new GuwahGuard({ policyPath });
+    const events: string[] = [];
+    const meta = { progressToken: "envelope-token", note: "operator context" };
+    let approvedMeta: unknown;
+
+    vi.spyOn(guard, "validateToolCall").mockImplementation((payload, args) => {
+      events.push("validate");
+      expect(payload).toMatchObject({
+        jsonrpc: "2.0",
+        method: "tools/call",
+        params: {
+          name: TOOL_NAME,
+          arguments: compliantArgs(),
+          _meta: meta,
+        },
+      });
+      expect(args).toEqual(compliantArgs());
+      expect(args).not.toHaveProperty("progressToken");
+      expect(events).not.toContain("dispatch");
+      return GuwahGuard.prototype.validateToolCall.call(guard, payload, args);
+    });
+
+    const server = createGuwahGatewayServer({
+      guard,
+      mediatedTools: [mediatedTransfer],
+      afterApproval: async (approved) => {
+        events.push("dispatch");
+        approvedMeta = approved.params._meta;
+        return {
+          content: [{ type: "text", text: "envelope-approved" }],
+        };
+      },
+    });
+    const { clientTransport, responses } = await initializePair(server);
+
+    await clientTransport.send({
+      jsonrpc: "2.0",
+      id: 2,
+      method: "tools/call",
+      params: {
+        name: TOOL_NAME,
+        arguments: compliantArgs(),
+        _meta: meta,
+      },
+    });
+    const callDeadline = Date.now() + 5000;
+    while (Date.now() < callDeadline && responses.length < 2) {
+      await new Promise((resolve) => {
+        setTimeout(resolve, 25);
+      });
+    }
+
+    expect(events).toEqual(["validate", "dispatch"]);
+    expect(approvedMeta).toEqual(meta);
+    expect(responses[1]).toMatchObject({
+      jsonrpc: "2.0",
+      id: 2,
+      result: {
+        content: [{ type: "text", text: "envelope-approved" }],
+      },
+    });
+
+    await server.close();
+    await clientTransport.close();
+  });
+
+  it("checks arguments through GuwahGuard and does not dispatch on denial", async () => {
+    const policyPath = writePolicy();
+    const guard = new GuwahGuard({ policyPath });
+    let dispatchCount = 0;
+
+    vi.spyOn(guard, "validateToolCall").mockImplementation((payload, args) => {
+      return GuwahGuard.prototype.validateToolCall.call(guard, payload, args);
+    });
+
+    const server = createGuwahGatewayServer({
+      guard,
+      mediatedTools: [mediatedTransfer],
+      afterApproval: async () => {
+        dispatchCount += 1;
+        return { content: [{ type: "text", text: "should-not-dispatch" }] };
+      },
+    });
+    const { clientTransport, responses } = await initializePair(server);
+
+    await clientTransport.send({
+      jsonrpc: "2.0",
+      id: 2,
+      method: "tools/call",
+      params: {
+        name: TOOL_NAME,
+        arguments: { ...compliantArgs(), amountMinor: 5001 },
+      },
+    });
+    const callDeadline = Date.now() + 5000;
+    while (Date.now() < callDeadline && responses.length < 2) {
+      await new Promise((resolve) => {
+        setTimeout(resolve, 25);
+      });
+    }
+
+    expect(dispatchCount).toBe(0);
+    expect(responses[1]).toMatchObject({
+      jsonrpc: "2.0",
+      id: 2,
+      error: {
+        code: -32600,
+        data: { guwahCode: "ARGUMENT_VALIDATION_FAILED" },
+      },
+    });
+    expect(responses[1]).not.toHaveProperty("result");
+
+    await server.close();
+    await clientTransport.close();
+  });
+
+  it("does not let _meta authorize a call when arguments violate policy", async () => {
+    const policyPath = writePolicy();
+    let dispatchCount = 0;
+    const server = createGuwahGatewayServer({
+      policyPath,
+      mediatedTools: [mediatedTransfer],
+      afterApproval: async () => {
+        dispatchCount += 1;
+        return { content: [{ type: "text", text: "should-not-dispatch" }] };
+      },
+    });
+    const { clientTransport, responses } = await initializePair(server);
+
+    await clientTransport.send({
+      jsonrpc: "2.0",
+      id: 2,
+      method: "tools/call",
+      params: {
+        name: TOOL_NAME,
+        arguments: { ...compliantArgs(), amountMinor: 5001 },
+        _meta: {
+          authorize: true,
+          amountMinor: 5000,
+          destinationAddress: WHITELISTED_DESTINATION,
+        },
+      },
+    });
+    const callDeadline = Date.now() + 5000;
+    while (Date.now() < callDeadline && responses.length < 2) {
+      await new Promise((resolve) => {
+        setTimeout(resolve, 25);
+      });
+    }
+
+    expect(dispatchCount).toBe(0);
+    expect(responses[1]).toMatchObject({
+      jsonrpc: "2.0",
+      id: 2,
+      error: {
+        code: -32600,
+        data: { guwahCode: "ARGUMENT_VALIDATION_FAILED" },
+      },
+    });
+    expect(responses[1]).not.toHaveProperty("result");
+
+    await server.close();
+    await clientTransport.close();
+  });
+});
+
+describe("alternate-envelope bypass", () => {
+  const TOOL_NAME = "coinbase_cdp_transfer";
+  const WHITELISTED_DESTINATION = "0x1111111111111111111111111111111111111111";
+
+  const TRANSFER_SCHEMA = {
+    $schema: "http://json-schema.org/draft-07/schema#",
+    type: "object",
+    additionalProperties: false,
+    required: ["amountMinor", "assetId", "destinationAddress", "memo"],
+    properties: {
+      amountMinor: { type: "integer", minimum: 1, maximum: 5000 },
+      assetId: { type: "string", enum: ["USDC"] },
+      destinationAddress: {
+        type: "string",
+        pattern: "^0x[0-9a-fA-F]{40}$",
+        enum: [WHITELISTED_DESTINATION],
+      },
+      memo: {
+        type: "string",
+        minLength: 1,
+        maxLength: 80,
+        pattern: "^[A-Za-z0-9 .,_:-]+$",
+      },
+    },
+  } as const;
+
+  const mediatedTransfer: GuwahMediatedTool = {
+    name: TOOL_NAME,
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      required: ["amountMinor", "assetId", "destinationAddress", "memo"],
+      properties: {
+        amountMinor: { type: "integer" },
+        assetId: { type: "string" },
+        destinationAddress: { type: "string" },
+        memo: { type: "string" },
+      },
+    },
+  };
+
+  function compliantArgs(): Record<string, unknown> {
+    return {
+      amountMinor: 5000,
+      assetId: "USDC",
+      destinationAddress: WHITELISTED_DESTINATION,
+      memo: "invoice 1001",
+    };
+  }
+
+  const policyDirs: string[] = [];
+
+  afterEach(() => {
+    for (const dir of policyDirs.splice(0, policyDirs.length)) {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  function writePolicy(): string {
+    const dir = mkdtempSync(path.join(tmpdir(), "guwah-gateway-alt-envelope-"));
+    policyDirs.push(dir);
+    const policyPath = path.join(dir, "guwah-policy.json");
+    writeFileSync(
+      policyPath,
+      `${JSON.stringify(
+        {
+          version: "1.0.0",
+          posture: "default-deny",
+          tools: {
+            [TOOL_NAME]: {
+              action: "ENFORCE",
+              argsSchema: structuredClone(TRANSFER_SCHEMA),
+            },
+          },
+        },
+        null,
+        2,
+      )}\n`,
+      "utf8",
+    );
+    return policyPath;
+  }
+
+  async function initializePair(
+    server: ReturnType<typeof createGuwahGatewayServer>,
+  ): Promise<{
+    clientTransport: ReturnType<typeof InMemoryTransport.createLinkedPair>[0];
+    responses: unknown[];
+  }> {
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await server.connect(serverTransport);
+    await clientTransport.start();
+
+    const responses: unknown[] = [];
+    clientTransport.onmessage = (message) => {
+      responses.push(message);
+    };
+
+    await clientTransport.send({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "initialize",
+      params: {
+        protocolVersion: "2025-11-25",
+        capabilities: {},
+        clientInfo: { name: "guwah-alt-envelope", version: "0.0.0" },
+      },
+    });
+    const initDeadline = Date.now() + 5000;
+    while (Date.now() < initDeadline && responses.length === 0) {
+      await new Promise((resolve) => {
+        setTimeout(resolve, 25);
+      });
+    }
+    await clientTransport.send({
+      jsonrpc: "2.0",
+      method: "notifications/initialized",
+    });
+    return { clientTransport, responses };
+  }
+
+  const UNSUPPORTED_METHODS: ReadonlyArray<string> = [
+    "provider/secretExecute",
+    "tools/execute",
+    "tools/invoke",
+    "Tools/Call",
+  ];
+
+  it.each(UNSUPPORTED_METHODS)(
+    "rejects unsupported method %s without dispatching tools",
+    async (method) => {
+      const policyPath = writePolicy();
+      let dispatchCount = 0;
+      const server = createGuwahGatewayServer({
+        policyPath,
+        mediatedTools: [mediatedTransfer],
+        afterApproval: async () => {
+          dispatchCount += 1;
+          return { content: [{ type: "text", text: "should-not-dispatch" }] };
+        },
+      });
+      const { clientTransport, responses } = await initializePair(server);
+
+      await clientTransport.send({
+        jsonrpc: "2.0",
+        id: 2,
+        method,
+        params: {
+          name: TOOL_NAME,
+          arguments: compliantArgs(),
+        },
+      });
+      const methodDeadline = Date.now() + 5000;
+      while (Date.now() < methodDeadline && responses.length < 2) {
+        await new Promise((resolve) => {
+          setTimeout(resolve, 25);
+        });
+      }
+
+      expect(responses.length).toBeGreaterThanOrEqual(2);
+      expect(responses[1]).toMatchObject({
+        jsonrpc: "2.0",
+        id: 2,
+        error: expect.objectContaining({
+          code: -32601,
+        }),
+      });
+      expect(responses[1]).not.toHaveProperty("result");
+      expect(dispatchCount).toBe(0);
+
+      await server.close();
+      await clientTransport.close();
+    },
+  );
+
+  it("cannot smuggle a tools/call payload through an unsupported method", async () => {
+    const policyPath = writePolicy();
+    let dispatchCount = 0;
+    const server = createGuwahGatewayServer({
+      policyPath,
+      mediatedTools: [mediatedTransfer],
+      afterApproval: async () => {
+        dispatchCount += 1;
+        return { content: [{ type: "text", text: "smuggled-dispatch" }] };
+      },
+    });
+    const { clientTransport, responses } = await initializePair(server);
+
+    await clientTransport.send({
+      jsonrpc: "2.0",
+      id: 2,
+      method: "provider/secretExecute",
+      params: {
+        jsonrpc: "2.0",
+        method: "tools/call",
+        name: TOOL_NAME,
+        arguments: compliantArgs(),
+        params: {
+          name: TOOL_NAME,
+          arguments: compliantArgs(),
+        },
+      },
+    });
+    const methodDeadline = Date.now() + 5000;
+    while (Date.now() < methodDeadline && responses.length < 2) {
+      await new Promise((resolve) => {
+        setTimeout(resolve, 25);
+      });
+    }
+
+    expect(responses[1]).toMatchObject({
+      jsonrpc: "2.0",
+      id: 2,
+      error: expect.objectContaining({
+        code: -32601,
+      }),
+    });
+    expect(dispatchCount).toBe(0);
+
+    await server.close();
+    await clientTransport.close();
+  });
+
+  it("wires tool execution only through the tools/call registration path", () => {
+    const source = readFileSync(GATEWAY_SOURCE, "utf8");
+    expect(source).toMatch(/Only tools\/call may execute tools/);
+    expect(source).toMatch(/registerGatewayToolsCall\(server, callOptions\)/);
+    expect(source).toMatch(/server\.setRequestHandler\(CallToolRequestSchema/);
+    const afterApprovalInvocations = source.match(/await options\.afterApproval\(approved\)/g) ?? [];
+    expect(afterApprovalInvocations).toHaveLength(1);
+    const callHandlerIndex = source.indexOf("server.setRequestHandler(CallToolRequestSchema");
+    const afterApprovalIndex = source.indexOf("await options.afterApproval(approved)");
+    expect(callHandlerIndex).toBeGreaterThan(-1);
+    expect(afterApprovalIndex).toBeGreaterThan(callHandlerIndex);
   });
 });
 

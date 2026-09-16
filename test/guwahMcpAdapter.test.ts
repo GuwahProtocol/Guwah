@@ -166,6 +166,56 @@ describe("GuwahMcpAdapter", () => {
     };
     expectViolation(() => adapter.approveToolCall(request), "INTERNAL_VALIDATION_ERROR");
   });
+
+  it("does not skip JSON-graph checks", () => {
+    const { adapter } = createAdapter();
+    const args = { ...compliantArgs(), destinationAddress: undefined as unknown as string };
+    expectViolation(() => adapter.approveToolCall(toolCallRequest(args)), "NON_JSON_VALUE");
+  });
+
+  it("does not skip MCP shape checks", () => {
+    const { adapter } = createAdapter();
+    const request = {
+      jsonrpc: "2.0",
+      id: "req-1",
+      method: "tools/list",
+      params: {
+        name: TOOL_NAME,
+        arguments: compliantArgs(),
+      },
+    };
+    expectViolation(() => adapter.approveToolCall(request), "INVALID_PAYLOAD");
+  });
+
+  it("preserves _meta without treating it as candidate arguments", () => {
+    const { adapter } = createAdapter();
+    const meta = {
+      progressToken: "token-1",
+      note: "operator context",
+    };
+    const request = toolCallRequest(compliantArgs());
+    const params = request["params"];
+    if (params === null || typeof params !== "object" || Array.isArray(params)) {
+      expect.unreachable("params");
+    }
+    Reflect.set(params, "_meta", meta);
+    const approved = adapter.approveToolCall(request);
+    expect(approved.params._meta).toEqual(meta);
+    expect(approved.params.arguments).toEqual(compliantArgs());
+    expect(approved.params.arguments).not.toHaveProperty("progressToken");
+    expect(approved.params.arguments).not.toHaveProperty("note");
+  });
+
+  it("rejects dangerous keys inside _meta without skipping graph checks", () => {
+    const { adapter } = createAdapter();
+    const request = toolCallRequest(compliantArgs());
+    const params = request["params"];
+    if (params === null || typeof params !== "object" || Array.isArray(params)) {
+      expect.unreachable("params");
+    }
+    Reflect.set(params, "_meta", { prototype: { polluted: true } });
+    expectViolation(() => adapter.approveToolCall(request), "DANGEROUS_OBJECT_KEY");
+  });
 });
 
 describe("module isolation", () => {
