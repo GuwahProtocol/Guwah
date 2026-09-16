@@ -924,6 +924,928 @@ describe("stdio transport binding", () => {
   });
 });
 
+describe("stdio initialize transport", () => {
+  const TOOL_NAME = "coinbase_cdp_transfer";
+  const WHITELISTED_DESTINATION = "0x1111111111111111111111111111111111111111";
+
+  const INITIALIZE_FIXTURE = {
+    jsonrpc: "2.0" as const,
+    id: 1,
+    method: "initialize",
+    params: {
+      protocolVersion: "2025-11-25",
+      capabilities: {},
+      clientInfo: { name: "guwah-stdio-initialize-fixture", version: "0.0.0" },
+    },
+  };
+
+  const MALFORMED_INITIALIZE_FIXTURE = {
+    jsonrpc: "2.0" as const,
+    id: 1,
+    method: "initialize",
+    params: {
+      protocolVersion: "2025-11-25",
+      capabilities: {},
+    },
+  };
+
+  const TRANSFER_SCHEMA = {
+    $schema: "http://json-schema.org/draft-07/schema#",
+    type: "object",
+    additionalProperties: false,
+    required: ["amountMinor", "assetId", "destinationAddress", "memo"],
+    properties: {
+      amountMinor: { type: "integer", minimum: 1, maximum: 5000 },
+      assetId: { type: "string", enum: ["USDC"] },
+      destinationAddress: {
+        type: "string",
+        pattern: "^0x[0-9a-fA-F]{40}$",
+        enum: [WHITELISTED_DESTINATION],
+      },
+      memo: {
+        type: "string",
+        minLength: 1,
+        maxLength: 80,
+        pattern: "^[A-Za-z0-9 .,_:-]+$",
+      },
+    },
+  } as const;
+
+  const mediatedTransfer: GuwahMediatedTool = {
+    name: TOOL_NAME,
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      required: ["amountMinor", "assetId", "destinationAddress", "memo"],
+      properties: {
+        amountMinor: { type: "integer" },
+        assetId: { type: "string" },
+        destinationAddress: { type: "string" },
+        memo: { type: "string" },
+      },
+    },
+  };
+
+  function compliantArgs(): Record<string, unknown> {
+    return {
+      amountMinor: 5000,
+      assetId: "USDC",
+      destinationAddress: WHITELISTED_DESTINATION,
+      memo: "invoice 1001",
+    };
+  }
+
+  const policyDirs: string[] = [];
+
+  afterEach(() => {
+    for (const dir of policyDirs.splice(0, policyDirs.length)) {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  function writePolicy(): string {
+    const dir = mkdtempSync(path.join(tmpdir(), "guwah-stdio-initialize-"));
+    policyDirs.push(dir);
+    const policyPath = path.join(dir, "guwah-policy.json");
+    writeFileSync(
+      policyPath,
+      `${JSON.stringify(
+        {
+          version: "1.0.0",
+          posture: "default-deny",
+          tools: {
+            [TOOL_NAME]: {
+              action: "ENFORCE",
+              argsSchema: structuredClone(TRANSFER_SCHEMA),
+            },
+          },
+        },
+        null,
+        2,
+      )}\n`,
+      "utf8",
+    );
+    return policyPath;
+  }
+
+  it("completes initialize over stdio with a protocol fixture", async () => {
+    const stdin = new PassThrough();
+    const stdout = new PassThrough();
+    const chunks: string[] = [];
+    stdout.setEncoding("utf8");
+    stdout.on("data", (chunk: string) => {
+      chunks.push(chunk);
+    });
+
+    const transport = createGuwahStdioTransport(stdin, stdout);
+    expect(transport).toBeInstanceOf(StdioServerTransport);
+
+    const { server } = await startGuwahStdioGateway({
+      stdin,
+      stdout,
+      onTransportFailure: () => {
+        throw new Error("unexpected transport failure during initialize fixture");
+      },
+    });
+
+    stdin.write(`${JSON.stringify(INITIALIZE_FIXTURE)}\n`);
+    const deadline = Date.now() + 5000;
+    while (Date.now() < deadline && chunks.join("").trim().length === 0) {
+      await new Promise((resolve) => {
+        setTimeout(resolve, 25);
+      });
+    }
+
+    const lines = chunks
+      .join("")
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0);
+    expect(lines.length).toBeGreaterThanOrEqual(1);
+    const parsed: unknown = JSON.parse(lines[0] ?? "{}");
+    expect(parsed).toMatchObject({
+      jsonrpc: "2.0",
+      id: INITIALIZE_FIXTURE.id,
+      result: {
+        protocolVersion: expect.any(String),
+        capabilities: GUWAH_GATEWAY_CAPABILITIES,
+        serverInfo: {
+          name: GUWAH_GATEWAY_NAME,
+          version: GUWAH_GATEWAY_VERSION,
+        },
+      },
+    });
+    expect(parsed).not.toHaveProperty("error");
+
+    await server.close();
+  });
+
+  it("malformed initialize must not dispatch", async () => {
+    const policyPath = writePolicy();
+    const stdin = new PassThrough();
+    const stdout = new PassThrough();
+    const chunks: string[] = [];
+    let dispatchCount = 0;
+    stdout.setEncoding("utf8");
+    stdout.on("data", (chunk: string) => {
+      chunks.push(chunk);
+    });
+
+    await startGuwahStdioGateway({
+      stdin,
+      stdout,
+      policyPath,
+      mediatedTools: [mediatedTransfer],
+      afterApproval: async () => {
+        dispatchCount += 1;
+        return { content: [{ type: "text", text: "should-not-dispatch" }] };
+      },
+    });
+
+    stdin.write(`${JSON.stringify(MALFORMED_INITIALIZE_FIXTURE)}\n`);
+    const initDeadline = Date.now() + 5000;
+    while (Date.now() < initDeadline && chunks.join("").trim().length === 0) {
+      await new Promise((resolve) => {
+        setTimeout(resolve, 25);
+      });
+    }
+    const initFrame = JSON.parse(
+      chunks
+        .join("")
+        .split(/\r?\n/)
+        .filter((line) => line.length > 0)[0] ?? "{}",
+    ) as Record<string, unknown>;
+    expect(initFrame).toMatchObject({
+      jsonrpc: "2.0",
+      id: 1,
+      error: expect.objectContaining({
+        code: expect.any(Number),
+      }),
+    });
+    expect(initFrame).not.toHaveProperty("result");
+
+    stdin.write(
+      `${JSON.stringify({
+        jsonrpc: "2.0",
+        method: "notifications/initialized",
+      })}\n`,
+    );
+    stdin.write(
+      `${JSON.stringify({
+        jsonrpc: "2.0",
+        id: 2,
+        method: "tools/call",
+        params: { name: TOOL_NAME, arguments: compliantArgs() },
+      })}\n`,
+    );
+    const callDeadline = Date.now() + 5000;
+    while (
+      Date.now() < callDeadline &&
+      chunks.join("").split(/\r?\n/).filter((line) => line.length > 0).length < 2
+    ) {
+      await new Promise((resolve) => {
+        setTimeout(resolve, 25);
+      });
+    }
+
+    expect(dispatchCount).toBe(0);
+    expect(chunks.join("")).not.toContain("should-not-dispatch");
+    const callFrame = chunks
+      .join("")
+      .split(/\r?\n/)
+      .filter((line) => line.length > 0)
+      .map((line) => JSON.parse(line) as Record<string, unknown>)
+      .find((frame) => frame.id === 2);
+    expect(callFrame).toMatchObject({
+      jsonrpc: "2.0",
+      id: 2,
+      error: {
+        message: expect.stringContaining("not initialized"),
+      },
+    });
+    expect(callFrame).not.toHaveProperty("result");
+  });
+});
+
+describe("stdio tools/list transport", () => {
+  const MEDIATED_TOOL_NAME = "authorized_transfer";
+  const UNVALIDATED_DOWNSTREAM_TOOL = "raw_provider_tool";
+
+  const INITIALIZE_FIXTURE = {
+    jsonrpc: "2.0" as const,
+    id: 1,
+    method: "initialize",
+    params: {
+      protocolVersion: "2025-11-25",
+      capabilities: {},
+      clientInfo: { name: "guwah-stdio-tools-list-fixture", version: "0.0.0" },
+    },
+  };
+
+  const TOOLS_LIST_FIXTURE = {
+    jsonrpc: "2.0" as const,
+    id: 2,
+    method: "tools/list",
+    params: {},
+  };
+
+  const mediatedTool: GuwahMediatedTool = {
+    name: MEDIATED_TOOL_NAME,
+    description: "Gateway-mediated fake transfer",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        amountMinor: { type: "integer" },
+      },
+      required: ["amountMinor"],
+    },
+  };
+
+  it("lists only gateway-mediated tools over stdio", async () => {
+    const stdin = new PassThrough();
+    const stdout = new PassThrough();
+    const chunks: string[] = [];
+    stdout.setEncoding("utf8");
+    stdout.on("data", (chunk: string) => {
+      chunks.push(chunk);
+    });
+
+    const { server } = await startGuwahStdioGateway({
+      stdin,
+      stdout,
+      mediatedTools: [mediatedTool],
+      resolveMediatedTools: () => [mediatedTool],
+      onTransportFailure: () => {
+        throw new Error("unexpected transport failure during tools/list fixture");
+      },
+    });
+
+    stdin.write(`${JSON.stringify(INITIALIZE_FIXTURE)}\n`);
+    const initDeadline = Date.now() + 5000;
+    while (Date.now() < initDeadline && chunks.join("").trim().length === 0) {
+      await new Promise((resolve) => {
+        setTimeout(resolve, 25);
+      });
+    }
+    stdin.write(`${JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" })}\n`);
+    stdin.write(`${JSON.stringify(TOOLS_LIST_FIXTURE)}\n`);
+
+    const listDeadline = Date.now() + 5000;
+    while (
+      Date.now() < listDeadline &&
+      chunks.join("").split(/\r?\n/).filter((line) => line.length > 0).length < 2
+    ) {
+      await new Promise((resolve) => {
+        setTimeout(resolve, 25);
+      });
+    }
+
+    const frames = chunks
+      .join("")
+      .split(/\r?\n/)
+      .filter((line) => line.length > 0)
+      .map((line) => JSON.parse(line) as Record<string, unknown>);
+    const listResponse = frames.find((frame) => frame.id === TOOLS_LIST_FIXTURE.id);
+    expect(listResponse).toMatchObject({
+      jsonrpc: "2.0",
+      id: 2,
+      result: {
+        tools: [
+          {
+            name: MEDIATED_TOOL_NAME,
+            description: "Gateway-mediated fake transfer",
+          },
+        ],
+      },
+    });
+    expect(listResponse).not.toHaveProperty("error");
+    const result = listResponse?.result as { tools: Array<{ name: string }> };
+    expect(result.tools.map((tool) => tool.name)).toEqual([MEDIATED_TOOL_NAME]);
+    expect(result.tools.map((tool) => tool.name)).not.toContain(UNVALIDATED_DOWNSTREAM_TOOL);
+    expect(JSON.stringify(listResponse)).not.toContain(UNVALIDATED_DOWNSTREAM_TOOL);
+
+    await server.close();
+  });
+
+  it("unvalidated downstream tools must not appear in stdio tools/list", async () => {
+    const stdin = new PassThrough();
+    const stdout = new PassThrough();
+    const chunks: string[] = [];
+    stdout.setEncoding("utf8");
+    stdout.on("data", (chunk: string) => {
+      chunks.push(chunk);
+    });
+
+    // Catalog resolver returns only the mediated set; downstream names stay omitted.
+    const { server } = await startGuwahStdioGateway({
+      stdin,
+      stdout,
+      resolveMediatedTools: () => [mediatedTool],
+      onTransportFailure: () => {
+        throw new Error("unexpected transport failure during tools/list omission fixture");
+      },
+    });
+
+    stdin.write(`${JSON.stringify(INITIALIZE_FIXTURE)}\n`);
+    const initDeadline = Date.now() + 5000;
+    while (Date.now() < initDeadline && chunks.join("").trim().length === 0) {
+      await new Promise((resolve) => {
+        setTimeout(resolve, 25);
+      });
+    }
+    stdin.write(`${JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" })}\n`);
+    stdin.write(`${JSON.stringify(TOOLS_LIST_FIXTURE)}\n`);
+
+    const listDeadline = Date.now() + 5000;
+    while (
+      Date.now() < listDeadline &&
+      chunks.join("").split(/\r?\n/).filter((line) => line.length > 0).length < 2
+    ) {
+      await new Promise((resolve) => {
+        setTimeout(resolve, 25);
+      });
+    }
+
+    const stdoutText = chunks.join("");
+    expect(stdoutText).not.toContain(UNVALIDATED_DOWNSTREAM_TOOL);
+    const frames = stdoutText
+      .split(/\r?\n/)
+      .filter((line) => line.length > 0)
+      .map((line) => JSON.parse(line) as Record<string, unknown>);
+    const listResponse = frames.find((frame) => frame.id === 2);
+    expect(listResponse).toMatchObject({
+      jsonrpc: "2.0",
+      id: 2,
+      result: {
+        tools: expect.any(Array),
+      },
+    });
+    const tools = (listResponse?.result as { tools: Array<{ name: string }> }).tools;
+    expect(tools.every((tool) => tool.name === MEDIATED_TOOL_NAME)).toBe(true);
+    expect(tools.some((tool) => tool.name === UNVALIDATED_DOWNSTREAM_TOOL)).toBe(false);
+
+    await server.close();
+  });
+});
+
+describe("stdio tools/call transport", () => {
+  const TOOL_NAME = "coinbase_cdp_transfer";
+  const WHITELISTED_DESTINATION = "0x1111111111111111111111111111111111111111";
+
+  const INITIALIZE_FIXTURE = {
+    jsonrpc: "2.0" as const,
+    id: 1,
+    method: "initialize",
+    params: {
+      protocolVersion: "2025-11-25",
+      capabilities: {},
+      clientInfo: { name: "guwah-stdio-tools-call-fixture", version: "0.0.0" },
+    },
+  };
+
+  const TRANSFER_SCHEMA = {
+    $schema: "http://json-schema.org/draft-07/schema#",
+    type: "object",
+    additionalProperties: false,
+    required: ["amountMinor", "assetId", "destinationAddress", "memo"],
+    properties: {
+      amountMinor: { type: "integer", minimum: 1, maximum: 5000 },
+      assetId: { type: "string", enum: ["USDC"] },
+      destinationAddress: {
+        type: "string",
+        pattern: "^0x[0-9a-fA-F]{40}$",
+        enum: [WHITELISTED_DESTINATION],
+      },
+      memo: {
+        type: "string",
+        minLength: 1,
+        maxLength: 80,
+        pattern: "^[A-Za-z0-9 .,_:-]+$",
+      },
+    },
+  } as const;
+
+  const mediatedTransfer: GuwahMediatedTool = {
+    name: TOOL_NAME,
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      required: ["amountMinor", "assetId", "destinationAddress", "memo"],
+      properties: {
+        amountMinor: { type: "integer" },
+        assetId: { type: "string" },
+        destinationAddress: { type: "string" },
+        memo: { type: "string" },
+      },
+    },
+  };
+
+  function compliantArgs(): Record<string, unknown> {
+    return {
+      amountMinor: 5000,
+      assetId: "USDC",
+      destinationAddress: WHITELISTED_DESTINATION,
+      memo: "invoice 1001",
+    };
+  }
+
+  function violatingArgs(): Record<string, unknown> {
+    return {
+      amountMinor: 5001,
+      assetId: "USDC",
+      destinationAddress: WHITELISTED_DESTINATION,
+      memo: "invoice 1001",
+    };
+  }
+
+  const policyDirs: string[] = [];
+
+  afterEach(() => {
+    for (const dir of policyDirs.splice(0, policyDirs.length)) {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  function writePolicy(): string {
+    const dir = mkdtempSync(path.join(tmpdir(), "guwah-stdio-tools-call-"));
+    policyDirs.push(dir);
+    const policyPath = path.join(dir, "guwah-policy.json");
+    writeFileSync(
+      policyPath,
+      `${JSON.stringify(
+        {
+          version: "1.0.0",
+          posture: "default-deny",
+          tools: {
+            [TOOL_NAME]: {
+              action: "ENFORCE",
+              argsSchema: structuredClone(TRANSFER_SCHEMA),
+            },
+          },
+        },
+        null,
+        2,
+      )}\n`,
+      "utf8",
+    );
+    return policyPath;
+  }
+
+  async function completeInitialize(stdin: PassThrough, chunks: string[]): Promise<void> {
+    stdin.write(`${JSON.stringify(INITIALIZE_FIXTURE)}\n`);
+    const initDeadline = Date.now() + 5000;
+    while (Date.now() < initDeadline && chunks.join("").trim().length === 0) {
+      await new Promise((resolve) => {
+        setTimeout(resolve, 25);
+      });
+    }
+    stdin.write(`${JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" })}\n`);
+  }
+
+  it("accepts a compliant tools/call over stdio only after the validator path runs", async () => {
+    const policyPath = writePolicy();
+    const guard = new GuwahGuard({ policyPath });
+    const events: string[] = [];
+    const stdin = new PassThrough();
+    const stdout = new PassThrough();
+    const chunks: string[] = [];
+    stdout.setEncoding("utf8");
+    stdout.on("data", (chunk: string) => {
+      chunks.push(chunk);
+    });
+
+    vi.spyOn(guard, "validateToolCall").mockImplementation((payload, args) => {
+      events.push("validate");
+      expect(payload).toMatchObject({
+        jsonrpc: "2.0",
+        method: "tools/call",
+        params: {
+          name: TOOL_NAME,
+          arguments: compliantArgs(),
+        },
+      });
+      expect(args).toEqual(compliantArgs());
+      expect(events).not.toContain("dispatch");
+      return GuwahGuard.prototype.validateToolCall.call(guard, payload, args);
+    });
+
+    const { server } = await startGuwahStdioGateway({
+      stdin,
+      stdout,
+      guard,
+      mediatedTools: [mediatedTransfer],
+      afterApproval: async (approved) => {
+        events.push("dispatch");
+        return {
+          content: [
+            {
+              type: "text",
+              text: `validated:${String(approved.params.name)}`,
+            },
+          ],
+        };
+      },
+      onTransportFailure: () => {
+        throw new Error("unexpected transport failure during tools/call fixture");
+      },
+    });
+
+    await completeInitialize(stdin, chunks);
+    stdin.write(
+      `${JSON.stringify({
+        jsonrpc: "2.0",
+        id: 2,
+        method: "tools/call",
+        params: { name: TOOL_NAME, arguments: compliantArgs() },
+      })}\n`,
+    );
+
+    const callDeadline = Date.now() + 5000;
+    while (
+      Date.now() < callDeadline &&
+      !chunks.join("").includes("validated:coinbase_cdp_transfer")
+    ) {
+      await new Promise((resolve) => {
+        setTimeout(resolve, 25);
+      });
+    }
+
+    expect(events).toEqual(["validate", "dispatch"]);
+    const frames = chunks
+      .join("")
+      .split(/\r?\n/)
+      .filter((line) => line.length > 0)
+      .map((line) => JSON.parse(line) as Record<string, unknown>);
+    const callResponse = frames.find((frame) => frame.id === 2);
+    expect(callResponse).toMatchObject({
+      jsonrpc: "2.0",
+      id: 2,
+      result: {
+        content: [{ type: "text", text: "validated:coinbase_cdp_transfer" }],
+      },
+    });
+    expect(callResponse).not.toHaveProperty("error");
+
+    await server.close();
+  });
+
+  it("does not disable validator checks for violating tools/call over stdio", async () => {
+    const policyPath = writePolicy();
+    const guard = new GuwahGuard({ policyPath });
+    const events: string[] = [];
+    const stdin = new PassThrough();
+    const stdout = new PassThrough();
+    const chunks: string[] = [];
+    stdout.setEncoding("utf8");
+    stdout.on("data", (chunk: string) => {
+      chunks.push(chunk);
+    });
+
+    vi.spyOn(guard, "validateToolCall").mockImplementation((payload, args) => {
+      events.push("validate");
+      expect(events).not.toContain("dispatch");
+      return GuwahGuard.prototype.validateToolCall.call(guard, payload, args);
+    });
+
+    const { server } = await startGuwahStdioGateway({
+      stdin,
+      stdout,
+      guard,
+      mediatedTools: [mediatedTransfer],
+      afterApproval: async () => {
+        events.push("dispatch");
+        return { content: [{ type: "text", text: "should-not-dispatch" }] };
+      },
+      onTransportFailure: () => {
+        throw new Error("unexpected transport failure during violating tools/call fixture");
+      },
+    });
+
+    await completeInitialize(stdin, chunks);
+    stdin.write(
+      `${JSON.stringify({
+        jsonrpc: "2.0",
+        id: 2,
+        method: "tools/call",
+        params: { name: TOOL_NAME, arguments: violatingArgs() },
+      })}\n`,
+    );
+
+    const callDeadline = Date.now() + 5000;
+    while (
+      Date.now() < callDeadline &&
+      chunks.join("").split(/\r?\n/).filter((line) => line.length > 0).length < 2
+    ) {
+      await new Promise((resolve) => {
+        setTimeout(resolve, 25);
+      });
+    }
+
+    expect(events).toEqual(["validate"]);
+    expect(events).not.toContain("dispatch");
+    expect(chunks.join("")).not.toContain("should-not-dispatch");
+    const frames = chunks
+      .join("")
+      .split(/\r?\n/)
+      .filter((line) => line.length > 0)
+      .map((line) => JSON.parse(line) as Record<string, unknown>);
+    const callResponse = frames.find((frame) => frame.id === 2);
+    expect(callResponse).toMatchObject({
+      jsonrpc: "2.0",
+      id: 2,
+      error: expect.objectContaining({
+        code: expect.any(Number),
+        message: expect.any(String),
+      }),
+    });
+    expect(callResponse).not.toHaveProperty("result");
+
+    await server.close();
+  });
+});
+
+describe("stdio invalid-request transport", () => {
+  const TOOL_NAME = "coinbase_cdp_transfer";
+  const WHITELISTED_DESTINATION = "0x1111111111111111111111111111111111111111";
+
+  const INITIALIZE_FIXTURE = {
+    jsonrpc: "2.0" as const,
+    id: 1,
+    method: "initialize",
+    params: {
+      protocolVersion: "2025-11-25",
+      capabilities: {},
+      clientInfo: { name: "guwah-stdio-invalid-request-fixture", version: "0.0.0" },
+    },
+  };
+
+  const TRANSFER_SCHEMA = {
+    $schema: "http://json-schema.org/draft-07/schema#",
+    type: "object",
+    additionalProperties: false,
+    required: ["amountMinor", "assetId", "destinationAddress", "memo"],
+    properties: {
+      amountMinor: { type: "integer", minimum: 1, maximum: 5000 },
+      assetId: { type: "string", enum: ["USDC"] },
+      destinationAddress: {
+        type: "string",
+        pattern: "^0x[0-9a-fA-F]{40}$",
+        enum: [WHITELISTED_DESTINATION],
+      },
+      memo: {
+        type: "string",
+        minLength: 1,
+        maxLength: 80,
+        pattern: "^[A-Za-z0-9 .,_:-]+$",
+      },
+    },
+  } as const;
+
+  const mediatedTransfer: GuwahMediatedTool = {
+    name: TOOL_NAME,
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      required: ["amountMinor", "assetId", "destinationAddress", "memo"],
+      properties: {
+        amountMinor: { type: "integer" },
+        assetId: { type: "string" },
+        destinationAddress: { type: "string" },
+        memo: { type: "string" },
+      },
+    },
+  };
+
+  function compliantArgs(): Record<string, unknown> {
+    return {
+      amountMinor: 5000,
+      assetId: "USDC",
+      destinationAddress: WHITELISTED_DESTINATION,
+      memo: "invoice 1001",
+    };
+  }
+
+  const policyDirs: string[] = [];
+
+  afterEach(() => {
+    for (const dir of policyDirs.splice(0, policyDirs.length)) {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  function writePolicy(): string {
+    const dir = mkdtempSync(path.join(tmpdir(), "guwah-stdio-invalid-request-"));
+    policyDirs.push(dir);
+    const policyPath = path.join(dir, "guwah-policy.json");
+    writeFileSync(
+      policyPath,
+      `${JSON.stringify(
+        {
+          version: "1.0.0",
+          posture: "default-deny",
+          tools: {
+            [TOOL_NAME]: {
+              action: "ENFORCE",
+              argsSchema: structuredClone(TRANSFER_SCHEMA),
+            },
+          },
+        },
+        null,
+        2,
+      )}\n`,
+      "utf8",
+    );
+    return policyPath;
+  }
+
+  async function completeInitialize(stdin: PassThrough, chunks: string[]): Promise<void> {
+    stdin.write(`${JSON.stringify(INITIALIZE_FIXTURE)}\n`);
+    const initDeadline = Date.now() + 5000;
+    while (Date.now() < initDeadline && chunks.join("").trim().length === 0) {
+      await new Promise((resolve) => {
+        setTimeout(resolve, 25);
+      });
+    }
+    stdin.write(`${JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" })}\n`);
+  }
+
+  it("returns a structured error for an invalid tools/call request with zero dispatch", async () => {
+    const policyPath = writePolicy();
+    let dispatchCount = 0;
+    const stdin = new PassThrough();
+    const stdout = new PassThrough();
+    const chunks: string[] = [];
+    stdout.setEncoding("utf8");
+    stdout.on("data", (chunk: string) => {
+      chunks.push(chunk);
+    });
+
+    const { server } = await startGuwahStdioGateway({
+      stdin,
+      stdout,
+      policyPath,
+      mediatedTools: [mediatedTransfer],
+      afterApproval: async () => {
+        dispatchCount += 1;
+        return { content: [{ type: "text", text: "should-not-dispatch" }] };
+      },
+      onTransportFailure: () => {
+        throw new Error("unexpected transport failure during invalid-request fixture");
+      },
+    });
+
+    await completeInitialize(stdin, chunks);
+    stdin.write(
+      `${JSON.stringify({
+        jsonrpc: "2.0",
+        id: 2,
+        method: "tools/call",
+        params: {
+          arguments: compliantArgs(),
+        },
+      })}\n`,
+    );
+
+    const callDeadline = Date.now() + 5000;
+    while (
+      Date.now() < callDeadline &&
+      chunks.join("").split(/\r?\n/).filter((line) => line.length > 0).length < 2
+    ) {
+      await new Promise((resolve) => {
+        setTimeout(resolve, 25);
+      });
+    }
+
+    expect(dispatchCount).toBe(0);
+    expect(chunks.join("")).not.toContain("should-not-dispatch");
+    const frames = chunks
+      .join("")
+      .split(/\r?\n/)
+      .filter((line) => line.length > 0)
+      .map((line) => JSON.parse(line) as Record<string, unknown>);
+    const callResponse = frames.find((frame) => frame.id === 2);
+    expect(callResponse).toMatchObject({
+      jsonrpc: "2.0",
+      id: 2,
+      error: {
+        code: expect.any(Number),
+        message: expect.any(String),
+      },
+    });
+    expect(callResponse).not.toHaveProperty("result");
+    const err = callResponse as { error: { code: number; message: string } };
+    expect(Number.isSafeInteger(err.error.code)).toBe(true);
+    expect(err.error.message.length).toBeGreaterThan(0);
+    expect(err.error.message).not.toContain(WHITELISTED_DESTINATION);
+
+    await server.close();
+  });
+
+  it("does not let a garbage frame reach downstream dispatch", async () => {
+    const policyPath = writePolicy();
+    let dispatchCount = 0;
+    const failures: unknown[] = [];
+    const stdin = new PassThrough();
+    const stdout = new PassThrough();
+    const chunks: string[] = [];
+    stdout.setEncoding("utf8");
+    stdout.on("data", (chunk: string) => {
+      chunks.push(chunk);
+    });
+
+    const { server, transport } = await startGuwahStdioGateway({
+      stdin,
+      stdout,
+      policyPath,
+      mediatedTools: [mediatedTransfer],
+      afterApproval: async () => {
+        dispatchCount += 1;
+        return { content: [{ type: "text", text: "should-not-dispatch" }] };
+      },
+      onTransportFailure: (error) => {
+        failures.push(error);
+      },
+    });
+
+    await completeInitialize(stdin, chunks);
+    const garbageFrame =
+      '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"coinbase_cdp_transfer"';
+    const followUpCall = JSON.stringify({
+      jsonrpc: "2.0",
+      id: 99,
+      method: "tools/call",
+      params: {
+        name: TOOL_NAME,
+        arguments: compliantArgs(),
+      },
+    });
+    stdin.write(`${garbageFrame}\n${followUpCall}\n`);
+
+    const deadline = Date.now() + 5000;
+    while (Date.now() < deadline && failures.length === 0) {
+      await new Promise((resolve) => {
+        setTimeout(resolve, 25);
+      });
+    }
+    await new Promise((resolve) => {
+      setTimeout(resolve, 100);
+    });
+
+    expect(failures.length).toBeGreaterThanOrEqual(1);
+    expect(dispatchCount).toBe(0);
+    expect(chunks.join("")).not.toContain("should-not-dispatch");
+    for (const frame of chunks.join("").split(/\r?\n/).filter((entry) => entry.length > 0)) {
+      const parsed: unknown = JSON.parse(frame);
+      expect(parsed).toMatchObject({ jsonrpc: "2.0" });
+      expect(parsed).not.toMatchObject({ id: 99, result: expect.anything() });
+    }
+
+    await server.close().catch(() => undefined);
+    await transport.close().catch(() => undefined);
+  });
+});
+
 describe("malformed MCP messages", () => {
   const TOOL_NAME = "coinbase_cdp_transfer";
   const WHITELISTED_DESTINATION = "0x1111111111111111111111111111111111111111";
@@ -1121,7 +2043,7 @@ describe("malformed MCP messages", () => {
   });
 });
 
-describe("stdin EOF lifecycle", () => {
+describe("gateway EOF", () => {
   const TOOL_NAME = "coinbase_cdp_transfer";
   const WHITELISTED_DESTINATION = "0x1111111111111111111111111111111111111111";
 
@@ -1204,7 +2126,7 @@ describe("stdin EOF lifecycle", () => {
     return policyPath;
   }
 
-  it("begins clean shutdown on stdin EOF and rejects further dispatch", async () => {
+  it("begins clean shutdown on stdin EOF and stops new calls", async () => {
     const policyPath = writePolicy();
     const stdin = new PassThrough();
     const stdout = new PassThrough();
@@ -1280,7 +2202,7 @@ describe("stdin EOF lifecycle", () => {
     expect(chunks.join("")).not.toMatch(/"id":2/);
   });
 
-  it("does not retry an in-flight tools/call when stdin EOF arrives mid-dispatch", async () => {
+  it("EOF during a call must not start an automatic retry", async () => {
     const policyPath = writePolicy();
     const stdin = new PassThrough();
     const stdout = new PassThrough();
@@ -3520,6 +4442,277 @@ describe("late response suppression", () => {
         .some((frame) => frame.id === 103 && "result" in frame);
       expect(successAfterError).toBe(false);
     }
+  });
+});
+
+describe("gateway shutdown", () => {
+  const TOOL_NAME = "coinbase_cdp_transfer";
+  const WHITELISTED_DESTINATION = "0x1111111111111111111111111111111111111111";
+
+  const TRANSFER_SCHEMA = {
+    $schema: "http://json-schema.org/draft-07/schema#",
+    type: "object",
+    additionalProperties: false,
+    required: ["amountMinor", "assetId", "destinationAddress", "memo"],
+    properties: {
+      amountMinor: { type: "integer", minimum: 1, maximum: 5000 },
+      assetId: { type: "string", enum: ["USDC"] },
+      destinationAddress: {
+        type: "string",
+        pattern: "^0x[0-9a-fA-F]{40}$",
+        enum: [WHITELISTED_DESTINATION],
+      },
+      memo: {
+        type: "string",
+        minLength: 1,
+        maxLength: 80,
+        pattern: "^[A-Za-z0-9 .,_:-]+$",
+      },
+    },
+  } as const;
+
+  const mediatedTransfer: GuwahMediatedTool = {
+    name: TOOL_NAME,
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      required: ["amountMinor", "assetId", "destinationAddress", "memo"],
+      properties: {
+        amountMinor: { type: "integer" },
+        assetId: { type: "string" },
+        destinationAddress: { type: "string" },
+        memo: { type: "string" },
+      },
+    },
+  };
+
+  function compliantArgs(): Record<string, unknown> {
+    return {
+      amountMinor: 5000,
+      assetId: "USDC",
+      destinationAddress: WHITELISTED_DESTINATION,
+      memo: "invoice 1001",
+    };
+  }
+
+  const policyDirs: string[] = [];
+
+  afterEach(() => {
+    for (const dir of policyDirs.splice(0, policyDirs.length)) {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  function writePolicy(): string {
+    const dir = mkdtempSync(path.join(tmpdir(), "guwah-gateway-shutdown-cases-"));
+    policyDirs.push(dir);
+    const policyPath = path.join(dir, "guwah-policy.json");
+    writeFileSync(
+      policyPath,
+      `${JSON.stringify(
+        {
+          version: "1.0.0",
+          posture: "default-deny",
+          tools: {
+            [TOOL_NAME]: {
+              action: "ENFORCE",
+              argsSchema: structuredClone(TRANSFER_SCHEMA),
+            },
+          },
+        },
+        null,
+        2,
+      )}\n`,
+      "utf8",
+    );
+    return policyPath;
+  }
+
+  function assertStdoutProtocolFramesOnly(stdoutText: string): void {
+    expect(stdoutText).not.toMatch(/started|ready|listening|banner|diagnostic|\bdebug\b/i);
+    const frames = stdoutText.split(/\r?\n/).filter((line) => line.length > 0);
+    let remainder = stdoutText;
+    for (const frame of frames) {
+      const index = remainder.indexOf(frame);
+      expect(index).toBeGreaterThanOrEqual(0);
+      expect(remainder.slice(0, index).replace(/\r?\n/g, "")).toBe("");
+      const parsed: unknown = JSON.parse(frame);
+      expect(parsed).toMatchObject({ jsonrpc: "2.0" });
+      remainder = remainder.slice(index + frame.length);
+    }
+    expect(remainder.replace(/\r?\n/g, "")).toBe("");
+  }
+
+  it("completes shutdown with protocol-clean stdout and no new calls", async () => {
+    const policyPath = writePolicy();
+    const stdin = new PassThrough();
+    const stdout = new PassThrough();
+    const chunks: string[] = [];
+    let eofCount = 0;
+    let dispatchCount = 0;
+    stdout.setEncoding("utf8");
+    stdout.on("data", (chunk: string) => {
+      chunks.push(chunk);
+    });
+
+    await startGuwahStdioGateway({
+      stdin,
+      stdout,
+      policyPath,
+      mediatedTools: [mediatedTransfer],
+      afterApproval: async () => {
+        dispatchCount += 1;
+        return { content: [{ type: "text", text: "should-not-run-after-shutdown" }] };
+      },
+      onStdinEof: () => {
+        eofCount += 1;
+      },
+    });
+
+    stdin.write(
+      `${JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "initialize",
+        params: {
+          protocolVersion: "2025-11-25",
+          capabilities: {},
+          clientInfo: { name: "guwah-shutdown-cases", version: "0.0.0" },
+        },
+      })}\n`,
+    );
+    const initDeadline = Date.now() + 5000;
+    while (Date.now() < initDeadline && chunks.join("").trim().length === 0) {
+      await new Promise((resolve) => {
+        setTimeout(resolve, 25);
+      });
+    }
+    expect(chunks.join("")).toContain('"id":1');
+
+    stdin.end();
+    const eofDeadline = Date.now() + 5000;
+    while (Date.now() < eofDeadline && eofCount === 0) {
+      await new Promise((resolve) => {
+        setTimeout(resolve, 25);
+      });
+    }
+    expect(eofCount).toBe(1);
+
+    const beforeLate = dispatchCount;
+    stdin.write(
+      `${JSON.stringify({
+        jsonrpc: "2.0",
+        id: 2,
+        method: "tools/call",
+        params: { name: TOOL_NAME, arguments: compliantArgs() },
+      })}\n`,
+    );
+    await new Promise((resolve) => {
+      setTimeout(resolve, 100);
+    });
+
+    expect(dispatchCount).toBe(beforeLate);
+    expect(chunks.join("")).not.toContain("should-not-run-after-shutdown");
+    assertStdoutProtocolFramesOnly(chunks.join(""));
+  });
+
+  it("must not emit a second mutating dispatch during shutdown", async () => {
+    const policyPath = writePolicy();
+    const stdin = new PassThrough();
+    const stdout = new PassThrough();
+    const chunks: string[] = [];
+    const events: string[] = [];
+    const failures: unknown[] = [];
+    let releaseDispatch: (() => void) | undefined;
+    const holdDispatch = new Promise<void>((resolve) => {
+      releaseDispatch = resolve;
+    });
+    let dispatchCount = 0;
+    stdout.setEncoding("utf8");
+    stdout.on("data", (chunk: string) => {
+      chunks.push(chunk);
+    });
+
+    await startGuwahStdioGateway({
+      stdin,
+      stdout,
+      policyPath,
+      mediatedTools: [mediatedTransfer],
+      shutdownGraceMs: 50,
+      afterApproval: async () => {
+        dispatchCount += 1;
+        events.push("dispatch-enter");
+        await holdDispatch;
+        events.push("dispatch-exit");
+        return { content: [{ type: "text", text: "first-dispatch-only" }] };
+      },
+      onTransportFailure: (error) => {
+        failures.push(error);
+      },
+      onStdinEof: () => {
+        events.push("eof-complete");
+      },
+    });
+
+    stdin.write(
+      `${JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "initialize",
+        params: {
+          protocolVersion: "2025-11-25",
+          capabilities: {},
+          clientInfo: { name: "guwah-shutdown-no-second", version: "0.0.0" },
+        },
+      })}\n`,
+    );
+    stdin.write(`${JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" })}\n`);
+    stdin.write(
+      `${JSON.stringify({
+        jsonrpc: "2.0",
+        id: 2,
+        method: "tools/call",
+        params: { name: TOOL_NAME, arguments: compliantArgs() },
+      })}\n`,
+    );
+
+    const enteredDeadline = Date.now() + 5000;
+    while (Date.now() < enteredDeadline && !events.includes("dispatch-enter")) {
+      await new Promise((resolve) => {
+        setTimeout(resolve, 25);
+      });
+    }
+    expect(dispatchCount).toBe(1);
+
+    stdin.end();
+    const eofDeadline = Date.now() + 5000;
+    while (Date.now() < eofDeadline && !events.includes("eof-complete")) {
+      await new Promise((resolve) => {
+        setTimeout(resolve, 25);
+      });
+    }
+    expect(events).toContain("eof-complete");
+    expect(events).not.toContain("dispatch-exit");
+
+    stdin.write(
+      `${JSON.stringify({
+        jsonrpc: "2.0",
+        id: 3,
+        method: "tools/call",
+        params: { name: TOOL_NAME, arguments: compliantArgs() },
+      })}\n`,
+    );
+    releaseDispatch?.();
+    await new Promise((resolve) => {
+      setTimeout(resolve, 150);
+    });
+
+    expect(dispatchCount).toBe(1);
+    expect(events.filter((entry) => entry === "dispatch-enter")).toHaveLength(1);
+    expect(chunks.join("")).not.toMatch(/"id":3/);
+    expect(chunks.join("")).not.toContain("should-not-run-after-shutdown");
+    assertStdoutProtocolFramesOnly(chunks.join(""));
+    expect(failures).toEqual([]);
   });
 });
 
