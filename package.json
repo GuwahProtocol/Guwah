@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "license": "Apache-2.0",
-  "description": "Gateway for User-Whitelisted Agent Handshakes — local, fail-closed MCP tool-call guard.",
+  "description": "Gateway User-Whitelist Agent Hub — local, fail-closed MCP tool-call guard.",
   "type": "module",
   "engines": {
     "node": "^20.19.0 || >=22.12.0"
@@ -27,14 +27,13 @@
     "gateway": "node dist/guwahGateway.js"
   },
   "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
     "ajv": "^8.17.1"
   },
   "devDependencies": {
     "@types/node": "^20.19.0",
     "typescript": "^5.9.2",
-    "vitest": "^3.2.4"
+    "vitest": "4.1.11"
   },
-  "optionalDependencies": {
-    "@modelcontextprotocol/sdk": "^1.30.0"
-  }
+  "packageManager": "npm@11.19.1"
 }

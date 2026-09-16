@@ -1,6 +1,6 @@
 # GUWAH Protocol Extension
 
-**Gateway for User-Whitelisted Agent Handshakes**
+**Gateway User-Whitelist Agent Hub**
 
 Local, fail-closed policy enforcement for Model Context Protocol `tools/call` payloads.
 
@@ -23,7 +23,7 @@ Guwah is a local, client-side policy enforcement layer for Model Context Protoco
 
 ## Execution Model
 
-The core validator terminates at local approval or denial. The gateway entry speaks MCP over stdio. Downstream tool execution is not implemented in this package yet.
+The core validator terminates at local approval or denial. The gateway entry speaks MCP over stdio and completes the official `initialize` / `initialized` handshake. Advertised capabilities stay limited to surfaces the gateway actually mediates; `tools/list` returns only the authorized mediated tool set. `tools/call` runs local Guwah validation before any downstream send. Unimplemented resources, prompts, and sampling are not claimed. Downstream tool execution is not configured by default.
 
 ```text
   [ Agent runtime ]
@@ -57,7 +57,7 @@ The core validator terminates at local approval or denial. The gateway entry spe
 
 `params._meta`, when present, is optional MCP protocol metadata. It is preserved in the approved copy, included in JSON-graph and resource-limit checks, and is not validated against the tool `argsSchema` or compared with candidate arguments.
 
-Vendor APIs (for example, a Coinbase-named mock tool in the sample policy) are downstream of the integrator. The core validator does not import Stripe, Coinbase, or MCP vendor SDKs and does not open sockets. The protocol adapter imports the official MCP TypeScript SDK for host `tools/call` shaping only and still delegates every approval to `GuwahGuard`. The gateway entry uses the official SDK stdio transport. Stdout is reserved for protocol frames.
+Vendor APIs (for example, a Coinbase-named mock tool in the sample policy) are downstream of the integrator. The core validator does not import Stripe, Coinbase, or MCP vendor SDKs and does not open sockets. The protocol adapter imports the official MCP TypeScript SDK for host `tools/call` shaping only and still delegates every approval to `GuwahGuard`. The gateway entry uses the official SDK `Server` and stdio transport so a conforming client can complete `initialize` and `initialized`. `tools/call` is refused until that handshake completes successfully, so a malformed or failed initialize cannot reach downstream dispatch. Capability negotiation returns only registered surfaces. `tools/list` returns the gateway-mediated catalog only and never an unfiltered downstream tool dump. `tools/call` runs `GuwahGuard.validateToolCall` on the complete envelope and candidate arguments before any downstream send; rejected calls never dispatch. In-flight `tools/call` request ids are tracked explicitly; duplicate ids are rejected and completed ids are removed. MCP `notifications/cancelled` cancels in-flight work and suppresses late success responses without automatic retry. Optional per-request deadlines (`requestTimeoutMs`) expire fail-closed so expired calls do not dispatch after expiry and are not retried. Results that arrive after cancel, deadline expiry, or shutdown abort are dropped so a client never receives a success after a terminal error for the same request id. Optional `maxConcurrentCalls` rejects excess in-flight `tools/call` requests fail-closed without queuing. When that bound is set, the stdio gateway pauses stdin reading at saturation and resumes when a slot frees; framing intake is capped by `maxBufferSize` (10 MiB when omitted). Buffer overflow or stdin pause/resume failure closes fail-closed rather than dropping validations. Protocol and security failures return JSON-RPC error objects; each `GuwahSecurityViolation` code maps to a fixed sanitized MCP error with an operator `guwahCode`, and unexpected handler exceptions become a generic internal error without rejected values. JSON-RPC is read from stdin and written to stdout only; stdout is reserved for protocol frames during startup, list, call, and shutdown. Malformed stdio framing fails closed without dispatch. Clean shutdown stops accepting work, waits or times out in-flight approved dispatches, then closes transports without corrupting stdout. Stdin EOF and SIGINT/SIGTERM begin that ordered shutdown. Broken stdout (including EPIPE) is a terminal transport failure; further protocol writes are suppressed. Diagnostics use a redacted stderr logger that omits detail by default and never emits credentials, full payloads, or policy text. Transport failures terminate fail-closed. HTTP and SSE transports are not used.
 
 ---
 
