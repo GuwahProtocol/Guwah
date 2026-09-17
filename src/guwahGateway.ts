@@ -25,6 +25,9 @@ export const GUWAH_DOWNSTREAM_TRANSPORT_CONFIG_ERROR =
   "Downstream transport configuration is missing or invalid.";
 export const GUWAH_DOWNSTREAM_CONNECTION_ERROR = "Downstream MCP connection failed.";
 export const GUWAH_DOWNSTREAM_CONNECTION_DEAD_ERROR = "Downstream MCP connection is dead.";
+export const GUWAH_TOOL_NAMESPACE_PREFIX = "guwah__";
+export const GUWAH_TOOL_NAMESPACE_ERROR = "Gateway tool name is ambiguous or invalid.";
+export const GUWAH_TOOL_COLLISION_ERROR = "Gateway tool name collision.";
 
 /**
  * Stable Guwah violation → MCP JSON-RPC error mapping.
@@ -115,9 +118,12 @@ export const GUWAH_GATEWAY_CAPABILITIES: Readonly<ServerCapabilities> = Object.f
 /**
  * A tool the gateway is authorized to mediate.
  * Downstream discovery must never bypass this catalog.
+ * `name` is the host-facing gateway name. `downstreamName` is the raw downstream
+ * tool name used for local policy and forwarding when namespacing is applied.
  */
 export type GuwahMediatedTool = {
   readonly name: string;
+  readonly downstreamName?: string;
   readonly description?: string;
   readonly inputSchema: Tool["inputSchema"];
 };
@@ -495,14 +501,26 @@ export function registerGatewayToolsCall(
       }
 
       const toolName = request.params.name;
-      if (!mediated.some((tool) => tool.name === toolName)) {
-        throw new McpError(ErrorCode.InvalidParams, "Requested tool is not mediated by the gateway.");
+      // Match the gateway-facing name only; never alias a guessed raw downstream name.
+      const mediatedTool = mediated.find((tool) => tool.name === toolName);
+      if (mediatedTool === undefined) {
+        // Unknown names are unauthorized by default; never reach afterApproval.
+        throw new GuwahSecurityViolation({
+          code: "UNAUTHORIZED_TOOL",
+          message: "Requested tool is not authorized by local policy.",
+          toolName,
+          rule: "tool-allowlist",
+        });
       }
 
-      const candidateArgs = request.params.arguments ?? {};
+      const policyToolName = mediatedTool.downstreamName ?? mediatedTool.name;
+      const rawArguments = request.params.arguments ?? {};
+      // Separate snapshots: parity compares embedded envelope args to candidate args.
+      // Do not pass one shared reference as a trust-the-host shortcut.
+      const candidateArgs = structuredClone(rawArguments);
       const params: Record<string, unknown> = {
-        name: toolName,
-        arguments: candidateArgs,
+        name: policyToolName,
+        arguments: structuredClone(rawArguments),
       };
       if (request.params._meta !== undefined) {
         params["_meta"] = request.params._meta;
@@ -515,10 +533,12 @@ export function registerGatewayToolsCall(
       };
 
       assertNotTerminal();
-      // Validation must complete before any dispatch serialization.
+      // Call path requires an explicit policy ENFORCE binding for the tool.
+      options.guard.assertToolEnforced(policyToolName);
+      // Both channels are required; validateToolCall enforces payload-argument parity.
       const approved = options.guard.validateToolCall(envelope, candidateArgs);
       assertNotTerminal();
-      // Terminal ids must not dispatch after cancel, expiry, or shutdown abort.
+      // Forward only the frozen approved copy; never the original candidate object.
       const result = await options.afterApproval(approved);
       // Drop late success after a terminal outcome; never forward it upstream.
       assertNotTerminal();
@@ -574,11 +594,19 @@ function resolveMaxConcurrentCalls(value: number | undefined): number | undefine
 function resolveCatalog(
   options?: Pick<GuwahGatewayServerOptions, "mediatedTools" | "resolveMediatedTools">,
 ): () => readonly GuwahMediatedTool[] {
-  if (options?.resolveMediatedTools !== undefined) {
-    return options.resolveMediatedTools;
-  }
-  const mediatedTools = options?.mediatedTools ?? [];
-  return () => mediatedTools;
+  const resolve: () => readonly GuwahMediatedTool[] = (() => {
+    if (options?.resolveMediatedTools !== undefined) {
+      return options.resolveMediatedTools;
+    }
+    const mediatedTools = options?.mediatedTools ?? [];
+    return () => mediatedTools;
+  })();
+  return () => {
+    const tools = resolve();
+    // Startup/refresh collision check: shared gateway names fail closed.
+    assertGuwahToolNamesUnique(tools);
+    return tools;
+  };
 }
 
 function resolveGuard(options?: GuwahGatewayServerOptions): GuwahGuard {
@@ -749,6 +777,8 @@ export type GuwahDownstreamConnection = {
  * silent success after a failed spawn or handshake.
  * After connect, exit/EOF/protocol death marks the connection dead fail-closed.
  * Automatic provider failover is not performed.
+ * Downstream is a gateway-owned client only; it must not be bound as a second
+ * host-visible MCP server on the gateway process stdio.
  */
 export async function connectGuwahDownstream(
   config: GuwahDownstreamTransportConfig,
@@ -838,6 +868,200 @@ export async function connectGuwahDownstream(
   };
 }
 
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function parseDiscoveredTool(entry: unknown): GuwahMediatedTool | undefined {
+  if (!isPlainObject(entry)) {
+    return undefined;
+  }
+  if (typeof entry["name"] !== "string" || entry["name"].trim().length === 0) {
+    return undefined;
+  }
+  if (!isPlainObject(entry["inputSchema"])) {
+    return undefined;
+  }
+  // Catalog shape only. Downstream inputSchema is never trusted as policy.
+  const tool: {
+    name: string;
+    description?: string;
+    inputSchema: Tool["inputSchema"];
+  } = {
+    name: entry["name"],
+    inputSchema: entry["inputSchema"] as Tool["inputSchema"],
+  };
+  if (typeof entry["description"] === "string") {
+    tool.description = entry["description"];
+  }
+  return Object.freeze(tool);
+}
+
+/**
+ * Runs tools/list against a healthy downstream connection.
+ * Discovery errors and malformed list payloads yield an empty mediated set.
+ * Never returns an unvalidated passthrough of downstream tool objects.
+ * Downstream schemas are catalog metadata only and are not treated as policy.
+ */
+export async function discoverGuwahDownstreamTools(
+  connection: Pick<GuwahDownstreamConnection, "client" | "isHealthy" | "assertHealthy">,
+): Promise<readonly GuwahMediatedTool[]> {
+  try {
+    connection.assertHealthy();
+  } catch {
+    return Object.freeze([]);
+  }
+  if (!connection.isHealthy()) {
+    return Object.freeze([]);
+  }
+
+  let listed: unknown;
+  try {
+    listed = await connection.client.listTools();
+  } catch {
+    // Discovery errors yield an empty mediated set, not passthrough.
+    return Object.freeze([]);
+  }
+
+  if (!isPlainObject(listed) || !Object.prototype.hasOwnProperty.call(listed, "tools")) {
+    return Object.freeze([]);
+  }
+  const toolsUnknown: unknown = listed["tools"];
+  if (!Array.isArray(toolsUnknown)) {
+    return Object.freeze([]);
+  }
+
+  const mediated: GuwahMediatedTool[] = [];
+  for (const entry of toolsUnknown) {
+    const parsed = parseDiscoveredTool(entry);
+    if (parsed === undefined) {
+      // Malformed list payloads are rejected entirely (no partial passthrough).
+      return Object.freeze([]);
+    }
+    mediated.push(parsed);
+  }
+  return Object.freeze(mediated);
+}
+
+/**
+ * Intersects discovered downstream tools with local policy ENFORCE names.
+ * Tools absent from policy are omitted from the gateway catalog (not advertised).
+ * Does not auto-authorize newly discovered tools.
+ * Catalog refresh must re-run this intersection; discovery churn alone cannot widen the allowlist.
+ */
+export function mirrorAuthorizedGuwahTools(
+  discovered: readonly GuwahMediatedTool[],
+  guard: GuwahGuard,
+): readonly GuwahMediatedTool[] {
+  let enforcedNames: ReadonlySet<string>;
+  try {
+    enforcedNames = new Set(guard.listEnforcedToolNames());
+  } catch {
+    // Policy load/parse failure → advertise nothing.
+    return Object.freeze([]);
+  }
+
+  const mirrored: GuwahMediatedTool[] = [];
+  for (const tool of discovered) {
+    if (!enforcedNames.has(tool.name)) {
+      // Extra downstream tools are omitted, not advertised.
+      continue;
+    }
+    mirrored.push(tool);
+  }
+  return Object.freeze(mirrored);
+}
+
+/**
+ * Deterministic gateway tool naming algorithm:
+ * 1. Downstream names must match `^[A-Za-z0-9][A-Za-z0-9_.-]*$`.
+ * 2. Downstream names must not already begin with `guwah__` (ambiguous; rejected, not re-aliased).
+ * 3. Gateway host name is exactly `guwah__` + downstream name.
+ * The mapping is pure and stable: the same downstream name always yields the same gateway name.
+ * Silent repair or operator rename UI is out of scope.
+ */
+export function namespaceGuwahToolName(downstreamName: string): string {
+  if (typeof downstreamName !== "string" || downstreamName.trim().length === 0) {
+    throw new Error(GUWAH_TOOL_NAMESPACE_ERROR);
+  }
+  if (downstreamName.startsWith(GUWAH_TOOL_NAMESPACE_PREFIX)) {
+    // Already namespaced names are ambiguous in a host session; reject rather than alias silently.
+    throw new Error(GUWAH_TOOL_NAMESPACE_ERROR);
+  }
+  if (!/^[A-Za-z0-9][A-Za-z0-9_.-]*$/.test(downstreamName)) {
+    throw new Error(GUWAH_TOOL_NAMESPACE_ERROR);
+  }
+  return `${GUWAH_TOOL_NAMESPACE_PREFIX}${downstreamName}`;
+}
+
+/**
+ * Returns the raw downstream name when `gatewayName` uses the Guwah namespace prefix.
+ */
+export function parseGuwahGatewayToolName(gatewayName: string): string | undefined {
+  if (typeof gatewayName !== "string" || !gatewayName.startsWith(GUWAH_TOOL_NAMESPACE_PREFIX)) {
+    return undefined;
+  }
+  const downstreamName = gatewayName.slice(GUWAH_TOOL_NAMESPACE_PREFIX.length);
+  if (downstreamName.length === 0) {
+    return undefined;
+  }
+  return downstreamName;
+}
+
+/**
+ * Applies deterministic host-facing namespacing to mirrored tools.
+ * Rejects ambiguous downstream names instead of silently aliasing them.
+ * Gateway `name` cannot equal the raw downstream name in the host session.
+ * Duplicate gateway names fail closed with no merge and no automatic suffix repair.
+ */
+export function applyGuwahToolNamespacing(
+  mirrored: readonly GuwahMediatedTool[],
+): readonly GuwahMediatedTool[] {
+  const namespaced: GuwahMediatedTool[] = [];
+  const seenGatewayNames = new Set<string>();
+  for (const tool of mirrored) {
+    const downstreamName = tool.downstreamName ?? tool.name;
+    const gatewayName = namespaceGuwahToolName(downstreamName);
+    if (seenGatewayNames.has(gatewayName)) {
+      // Collision is fail-closed; do not merge schemas or invent suffixes.
+      throw new Error(GUWAH_TOOL_COLLISION_ERROR);
+    }
+    seenGatewayNames.add(gatewayName);
+    const next: {
+      name: string;
+      downstreamName: string;
+      description?: string;
+      inputSchema: Tool["inputSchema"];
+    } = {
+      name: gatewayName,
+      downstreamName,
+      inputSchema: tool.inputSchema,
+    };
+    if (tool.description !== undefined) {
+      next.description = tool.description;
+    }
+    namespaced.push(Object.freeze(next));
+  }
+  return Object.freeze(namespaced);
+}
+
+/**
+ * Rejects catalogs where two tools share a host-facing gateway name.
+ * Fail closed: no merged schema and no automatic suffixing.
+ */
+export function assertGuwahToolNamesUnique(tools: readonly GuwahMediatedTool[]): void {
+  const seen = new Set<string>();
+  for (const tool of tools) {
+    if (typeof tool.name !== "string" || tool.name.trim().length === 0) {
+      throw new Error(GUWAH_TOOL_COLLISION_ERROR);
+    }
+    if (seen.has(tool.name)) {
+      throw new Error(GUWAH_TOOL_COLLISION_ERROR);
+    }
+    seen.add(tool.name);
+  }
+}
+
 /**
  * Builds the MCP gateway server.
  * `initialize` and `initialized` are handled by the official SDK Server.
@@ -866,6 +1090,15 @@ export function createGuwahGatewayServer(options?: GuwahGatewayServerOptions): S
     }
   };
   const resolveMediatedTools = resolveCatalog(options);
+  try {
+    // Reject colliding gateway names at startup when the catalog can be resolved.
+    resolveMediatedTools();
+  } catch (error: unknown) {
+    if (error instanceof Error && error.message === GUWAH_TOOL_COLLISION_ERROR) {
+      throw error;
+    }
+    // Non-collision catalog failures remain deferred to list/call handlers.
+  }
   const activeRequests = options?.activeRequests ?? new GuwahActiveRequestRegistry();
   const requestTimeoutMs = resolveRequestTimeoutMs(options?.requestTimeoutMs);
   const maxConcurrentCalls = resolveMaxConcurrentCalls(options?.maxConcurrentCalls);
@@ -1117,12 +1350,20 @@ export async function startGuwahStdioGateway(
 }> {
   // Missing path => deny-all (no implicit localhost). Provided path must validate and connect.
   let downstreamConnection: GuwahDownstreamConnection | undefined;
+  let mirroredMediatedTools: readonly GuwahMediatedTool[] | undefined;
   if (options?.downstreamTransportConfigPath !== undefined) {
     const downstreamConfig = loadGuwahDownstreamTransportConfig(
       options.downstreamTransportConfigPath,
     );
     // Failed connect must not proceed to a tool-exposing gateway server.
     downstreamConnection = await connectGuwahDownstream(downstreamConfig);
+    const guard = resolveGuard(options);
+    const discovered = await discoverGuwahDownstreamTools(downstreamConnection);
+    // Gateway tools/list is policy ∩ discovery; extras are omitted, never auto-authorized.
+    // Host-facing names are deterministically namespaced away from raw downstream names.
+    mirroredMediatedTools = applyGuwahToolNamespacing(
+      mirrorAuthorizedGuwahTools(discovered, guard),
+    );
   }
 
   const stdinStream = options?.stdin ?? process.stdin;
@@ -1193,6 +1434,7 @@ export async function startGuwahStdioGateway(
   const userAfterApproval = options?.afterApproval ?? defaultAfterApproval;
   const serverOptions = buildServerOptionsFromStdio({
     ...options,
+    ...(mirroredMediatedTools !== undefined ? { mediatedTools: mirroredMediatedTools } : {}),
     activeRequests,
     afterApproval: async (approved) => {
       if (!acceptingNewMessages) {
@@ -1414,6 +1656,8 @@ function failStartup(): void {
 }
 
 if (isGatewayEntry()) {
+  // Host-facing entry starts only the gateway server on process stdio.
+  // Downstream clients, when configured, are not registered as additional host servers.
   startGuwahStdioGateway({
     enableTerminationSignals: true,
     onStdinEof: () => {

@@ -1560,6 +1560,54 @@ export class GuwahGuard {
     }
   }
 
+  /**
+   * Returns tool names with policy action ENFORCE.
+   * DENY and unknown tools are omitted. Used to mirror discovery without auto-authorizing.
+   */
+  public listEnforcedToolNames(): readonly string[] {
+    const compiled = this.loadCompiledPolicy();
+    const names: string[] = [];
+    for (const [toolName, toolPolicy] of compiled.tools) {
+      if (toolPolicy.action === ENFORCE_ACTION) {
+        names.push(toolName);
+      }
+    }
+    names.sort();
+    return Object.freeze(names);
+  }
+
+  /**
+   * Requires an explicit policy tools-map entry with action ENFORCE.
+   * Unknown tools and DENY entries fail closed before argument validation.
+   */
+  public assertToolEnforced(toolName: string): void {
+    if (typeof toolName !== "string" || toolName.trim().length === 0) {
+      fail({
+        code: "UNAUTHORIZED_TOOL",
+        message: "Requested tool is not authorized by local policy.",
+        rule: "tool-allowlist",
+      });
+    }
+    const compiled = this.loadCompiledPolicy();
+    const toolPolicy = compiled.tools.get(toolName);
+    if (toolPolicy === undefined) {
+      fail({
+        code: "UNAUTHORIZED_TOOL",
+        message: "Requested tool is not authorized by local policy.",
+        toolName,
+        rule: "tool-allowlist",
+      });
+    }
+    if (toolPolicy.action !== ENFORCE_ACTION) {
+      fail({
+        code: "POLICY_NOT_ENFORCED",
+        message: "Requested tool is not configured for local enforcement.",
+        toolName,
+        rule: "action",
+      });
+    }
+  }
+
   private executeValidation(payload: unknown, args: unknown): Readonly<McpToolCallPayload> {
     assertJsonCompatibleGraph(payload, "", this.limits);
     assertJsonCompatibleGraph(args, "", this.limits);
