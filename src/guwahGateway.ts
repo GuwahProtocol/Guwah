@@ -32,6 +32,8 @@ export const GUWAH_DOWNSTREAM_OUTCOME_UNKNOWN_ERROR =
   "Downstream call outcome is unknown after connection loss or reconnect.";
 export const GUWAH_DOWNSTREAM_UNAVAILABLE_CODE = "DOWNSTREAM_UNAVAILABLE";
 export const GUWAH_DOWNSTREAM_OUTCOME_UNKNOWN_CODE = "DOWNSTREAM_OUTCOME_UNKNOWN";
+export const GUWAH_DOWNSTREAM_FAILURE_ERROR = "Downstream tool call failed.";
+export const GUWAH_DOWNSTREAM_FAILURE_CODE = "DOWNSTREAM_FAILURE";
 export const GUWAH_TOOL_NAMESPACE_PREFIX = "guwah__";
 export const GUWAH_TOOL_NAMESPACE_ERROR = "Gateway tool name is ambiguous or invalid.";
 export const GUWAH_TOOL_COLLISION_ERROR = "Gateway tool name collision.";
@@ -112,6 +114,47 @@ export function mapGuwahViolationToMcpError(error: GuwahSecurityViolation): McpE
 }
 
 /**
+ * Maps a downstream tool failure to a secret-free gateway MCP error.
+ * Downstream messages are never copied; they may contain credentials or arguments.
+ */
+export function mapGuwahDownstreamFailureToMcpError(_error: unknown): McpError {
+  return new McpError(ErrorCode.InternalError, GUWAH_DOWNSTREAM_FAILURE_ERROR, {
+    guwahCode: GUWAH_DOWNSTREAM_FAILURE_CODE,
+  });
+}
+
+/**
+ * True when an MCP error was emitted by Guwah with a stable operator message.
+ * Downstream SDK/provider errors must not match and must be remapped.
+ */
+export function isGuwahEmittedMcpError(error: McpError): boolean {
+  const data = error.data as { guwahCode?: unknown } | undefined;
+  if (typeof data?.guwahCode === "string" && data.guwahCode.length > 0) {
+    return true;
+  }
+  const trustedMessages = new Set<string>([
+    "Tool call was cancelled.",
+    "Tool call deadline expired.",
+    "Tool call aborted during shutdown.",
+    "Tool call is no longer active.",
+    "Gateway is not initialized.",
+    "Tool call is missing a request id.",
+    "Duplicate request id is already active.",
+    "Concurrent tool call limit reached.",
+    "Gateway tool catalog is unavailable.",
+    "Gateway is shutting down.",
+    "Tool call handling failed.",
+    GUWAH_DOWNSTREAM_FAILURE_ERROR,
+    GUWAH_DOWNSTREAM_CONNECTION_DEAD_ERROR,
+    GUWAH_DOWNSTREAM_RECONNECTING_ERROR,
+    GUWAH_DOWNSTREAM_OUTCOME_UNKNOWN_ERROR,
+  ]);
+  // McpError prefixes messages as "MCP error <code>: <operator text>".
+  const operatorText = error.message.replace(/^MCP error -?\d+:\s*/u, "");
+  return trustedMessages.has(error.message) || trustedMessages.has(operatorText);
+}
+
+/**
  * Advertised MCP server capabilities.
  * Only surfaces with registered handlers may appear here.
  * tools/list and tools/call are registered, so tools is advertised.
@@ -128,12 +171,109 @@ export const GUWAH_GATEWAY_CAPABILITIES: Readonly<ServerCapabilities> = Object.f
  * `name` is the host-facing gateway name. `downstreamName` is the raw downstream
  * tool name used for local policy and forwarding when namespacing is applied.
  */
+/**
+ * Authorized mediated catalog entry surfaced on tools/list and tools/call.
+ * Tools are treated as mutating unless explicitly classified otherwise.
+ * Automatic retry is never performed for mutating tools; read-only retry is out of scope.
+ */
+export type GuwahToolSideEffectClass = "mutating" | "read-only";
+
 export type GuwahMediatedTool = {
   readonly name: string;
   readonly downstreamName?: string;
   readonly description?: string;
   readonly inputSchema: Tool["inputSchema"];
+  /**
+   * Explicit side-effect class. When omitted, the tool is mutating.
+   */
+  readonly sideEffectClass?: GuwahToolSideEffectClass;
 };
+
+/**
+ * Resolves the side-effect class for a mediated tool.
+ * Unclassified tools are mutating (fail-closed against automatic retry).
+ */
+export function classifyGuwahToolSideEffect(
+  tool: Pick<GuwahMediatedTool, "sideEffectClass"> | GuwahToolSideEffectClass | undefined,
+): GuwahToolSideEffectClass {
+  if (tool === undefined) {
+    return "mutating";
+  }
+  if (tool === "mutating" || tool === "read-only") {
+    return tool;
+  }
+  return tool.sideEffectClass === "read-only" ? "read-only" : "mutating";
+}
+
+/**
+ * Whether the gateway may automatically retry a downstream tools/call.
+ * Always false today: mutating tools never auto-retry, and read-only retry is not defined.
+ */
+export function guwahToolAllowsAutomaticRetry(
+  tool: Pick<GuwahMediatedTool, "sideEffectClass"> | GuwahToolSideEffectClass | undefined,
+): boolean {
+  // Classification is recorded for operators; automatic retry remains prohibited.
+  void classifyGuwahToolSideEffect(tool);
+  return false;
+}
+
+/**
+ * MCP params._meta key for an explicit Guwah idempotency key.
+ * Provider-native idempotency APIs are out of scope.
+ */
+export const GUWAH_IDEMPOTENCY_META_KEY = "guwah/idempotencyKey";
+
+/**
+ * Optional enforcer for reusing a prior outcome under an explicit idempotency key.
+ * Must never match or coalesce on tool arguments alone.
+ */
+export type GuwahIdempotencyEnforcer = {
+  readonly tryReuse: (key: string) => CallToolResult | undefined;
+};
+
+/**
+ * Reads an explicit idempotency key from approved tool-call metadata.
+ * Empty or non-string values are treated as absent.
+ */
+export function resolveGuwahIdempotencyKey(
+  meta: Readonly<Record<string, unknown>> | undefined,
+): string | undefined {
+  if (meta === undefined) {
+    return undefined;
+  }
+  const value = meta[GUWAH_IDEMPOTENCY_META_KEY];
+  if (typeof value !== "string") {
+    return undefined;
+  }
+  const trimmed = value.trim();
+  return trimmed.length === 0 ? undefined : trimmed;
+}
+
+/**
+ * Whether a mutating tools/call may reuse a prior outcome.
+ * Requires both an explicit key and a configured enforcer.
+ * Absent key (even with a duplicate payload) must never auto-deduplicate.
+ */
+export function guwahMayCoalesceMutatingCall(options: {
+  readonly idempotencyKey: string | undefined;
+  readonly enforcerConfigured: boolean;
+}): boolean {
+  return options.idempotencyKey !== undefined && options.enforcerConfigured === true;
+}
+
+export type GuwahAfterApprovalContext = {
+  /**
+   * Aborted when the host cancels the gateway tools/call.
+   * Downstream dispatch must use this signal so cancel propagates as
+   * notifications/cancelled — never as a second mutating tools/call.
+   */
+  readonly signal: AbortSignal;
+};
+
+export type GuwahAfterApprovalHandler = (
+  approved: Readonly<McpToolCallPayload>,
+  context: GuwahAfterApprovalContext,
+) => CallToolResult | Promise<CallToolResult>;
 
 export type GuwahGatewayServerOptions = {
   /**
@@ -155,10 +295,15 @@ export type GuwahGatewayServerOptions = {
   /**
    * Invoked only after local validation approval.
    * Must never run for rejected calls. Defaults to a validator-only success with no downstream send.
+   * Receives a cancel signal for propagating host cancellation downstream.
    */
-  readonly afterApproval?: (
-    approved: Readonly<McpToolCallPayload>,
-  ) => CallToolResult | Promise<CallToolResult>;
+  readonly afterApproval?: GuwahAfterApprovalHandler;
+  /**
+   * Optional idempotency enforcer. When omitted, every approved call is a new
+   * dispatch even if the host repeats identical arguments.
+   * Coalescing requires both this enforcer and an explicit idempotency key in _meta.
+   */
+  readonly idempotencyEnforcer?: GuwahIdempotencyEnforcer;
   /**
    * In-flight tools/call request-id registry. Defaults to a fresh registry per server.
    */
@@ -311,9 +456,11 @@ export type GuwahStdioGatewayOptions = {
   readonly beforeResolveMediatedTools?: () => void | Promise<void>;
   readonly policyPath?: string;
   readonly guard?: GuwahGuard;
-  readonly afterApproval?: (
-    approved: Readonly<McpToolCallPayload>,
-  ) => CallToolResult | Promise<CallToolResult>;
+  readonly afterApproval?: GuwahAfterApprovalHandler;
+  /**
+   * Optional idempotency enforcer. When omitted, duplicate payloads are never coalesced.
+   */
+  readonly idempotencyEnforcer?: GuwahIdempotencyEnforcer;
   /**
    * Local path to downstream MCP transport configuration.
    * When set, the file must load and validate or startup fails closed.
@@ -381,7 +528,10 @@ function toProtocolTools(mediated: readonly GuwahMediatedTool[]): Tool[] {
   });
 }
 
-function defaultAfterApproval(): CallToolResult {
+function defaultAfterApproval(
+  _approved: Readonly<McpToolCallPayload>,
+  _context: GuwahAfterApprovalContext,
+): CallToolResult {
   return {
     content: [
       {
@@ -438,14 +588,13 @@ export function registerGatewayToolsCall(
     readonly resolveMediatedTools: () => readonly GuwahMediatedTool[];
     readonly beforeResolveMediatedTools?: () => void | Promise<void>;
     readonly guard: GuwahGuard;
-    readonly afterApproval: (
-      approved: Readonly<McpToolCallPayload>,
-    ) => CallToolResult | Promise<CallToolResult>;
+    readonly afterApproval: GuwahAfterApprovalHandler;
     readonly activeRequests: GuwahActiveRequestRegistry;
     readonly requestTimeoutMs?: number;
     readonly maxConcurrentCalls?: number;
     readonly onActiveCountChange?: (activeCount: number) => void;
     readonly isHandshakeComplete: () => boolean;
+    readonly idempotencyEnforcer?: GuwahIdempotencyEnforcer;
   },
 ): void {
   server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
@@ -477,8 +626,17 @@ export function registerGatewayToolsCall(
     }
     options.onActiveCountChange?.(options.activeRequests.size());
 
+    // Linked to in-flight downstream tools/call; abort forwards notifications/cancelled.
+    const downstreamCancel = new AbortController();
+    const abortDownstream = (): void => {
+      if (!downstreamCancel.signal.aborted) {
+        // Terminal outcomes must stop the downstream wait so late bodies cannot become success.
+        downstreamCancel.abort();
+      }
+    };
     const markCancelled = (): void => {
       options.activeRequests.tryCancel(requestId);
+      abortDownstream();
     };
     if (extra.signal.aborted) {
       markCancelled();
@@ -488,6 +646,7 @@ export function registerGatewayToolsCall(
 
     const markExpired = (): void => {
       options.activeRequests.tryExpire(requestId);
+      abortDownstream();
     };
     let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
     if (options.requestTimeoutMs !== undefined) {
@@ -506,6 +665,7 @@ export function registerGatewayToolsCall(
       }
       if (options.activeRequests.isAborted(requestId)) {
         options.activeRequests.tryAbort(requestId);
+        abortDownstream();
         throw new McpError(ErrorCode.InvalidRequest, "Tool call aborted during shutdown.");
       }
     };
@@ -562,17 +722,41 @@ export function registerGatewayToolsCall(
       // Policy argsSchema remains enforcement after discovery remirror; catalog inputSchema is not trusted.
       const approved = options.guard.validateToolCall(envelope, candidateArgs);
       assertNotTerminal();
+      // Mutating calls never coalesce on payload alone. Reuse requires an explicit
+      // idempotency key in _meta and a configured enforcer.
+      const idempotencyKey = resolveGuwahIdempotencyKey(approved.params._meta);
+      const enforcer = options.idempotencyEnforcer;
+      if (
+        idempotencyKey !== undefined &&
+        enforcer !== undefined &&
+        guwahMayCoalesceMutatingCall({
+          idempotencyKey,
+          enforcerConfigured: true,
+        })
+      ) {
+        const reused = enforcer.tryReuse(idempotencyKey);
+        if (reused !== undefined) {
+          assertNotTerminal();
+          return reused;
+        }
+      }
       // Forward only the frozen approved copy; never the original candidate object.
-      const result = await options.afterApproval(approved);
+      const result = await options.afterApproval(approved, {
+        signal: downstreamCancel.signal,
+      });
       // Drop late success after a terminal outcome; never forward it upstream.
       assertNotTerminal();
       return result;
     } catch (error: unknown) {
-      if (error instanceof McpError) {
-        throw error;
-      }
       if (error instanceof GuwahSecurityViolation) {
         throw mapGuwahViolationToMcpError(error);
+      }
+      if (error instanceof McpError && isGuwahEmittedMcpError(error)) {
+        throw error;
+      }
+      if (error instanceof McpError) {
+        // Downstream or other untrusted MCP errors may embed secrets in message/data.
+        throw mapGuwahDownstreamFailureToMcpError(error);
       }
       // Do not forward Error.message: unexpected throws may contain rejected values.
       throw new McpError(ErrorCode.InternalError, "Tool call handling failed.");
@@ -665,6 +849,60 @@ export function createGuwahDownstreamClient(options?: {
   } catch {
     // Fail closed: do not return a passthrough or unofficial substitute.
     throw new Error("Downstream MCP client construction failed.");
+  }
+}
+
+/**
+ * Forwards an approved tools/call to a downstream MCP client once.
+ * Host cancel is propagated via AbortSignal → notifications/cancelled.
+ * Never issues a second tools/call as a cancel substitute, and never retries
+ * when cancel is unsupported or the request is aborted.
+ * A result that arrives after the signal is aborted is discarded without logging
+ * the body and is never returned as upstream success.
+ * Timeout, reset, and error paths perform a single attempt only: tools are
+ * mutating unless explicitly classified otherwise, and automatic retry is prohibited.
+ */
+export async function callGuwahDownstreamToolWithCancelPropagation(options: {
+  readonly client: Pick<Client, "callTool">;
+  readonly name: string;
+  readonly arguments?: Record<string, unknown>;
+  readonly signal: AbortSignal;
+  /**
+   * Optional mediated-tool classification. Omitted tools are mutating.
+   * Does not enable automatic retry even when classified read-only.
+   */
+  readonly tool?: Pick<GuwahMediatedTool, "sideEffectClass">;
+}): Promise<CallToolResult> {
+  // Tools default to mutating; automatic retry is never performed (read-only retry out of scope).
+  void classifyGuwahToolSideEffect(options.tool);
+  const params: {
+    name: string;
+    arguments?: Record<string, unknown>;
+  } = {
+    name: options.name,
+  };
+  if (options.arguments !== undefined) {
+    params.arguments = options.arguments;
+  }
+  try {
+    // Single mutating dispatch. Abort uses protocol cancel notification only.
+    const result = await options.client.callTool(params, undefined, {
+      signal: options.signal,
+    });
+    // Late downstream success after terminal cancel/timeout: drop body, do not log it.
+    if (options.signal.aborted) {
+      throw new McpError(ErrorCode.InvalidRequest, "Tool call is no longer active.");
+    }
+    return result as CallToolResult;
+  } catch (error: unknown) {
+    if (options.signal.aborted) {
+      throw new McpError(ErrorCode.InvalidRequest, "Tool call is no longer active.");
+    }
+    if (error instanceof McpError && isGuwahEmittedMcpError(error)) {
+      throw error;
+    }
+    // Timeout, reset, or provider error: single attempt; never copy downstream text.
+    throw mapGuwahDownstreamFailureToMcpError(error);
   }
 }
 
@@ -1061,15 +1299,11 @@ export function mapGuwahDownstreamDispatchStateToMcpError(
  * Distinguishes blocked-locally (pre-dispatch) from outcome-unknown (post-dispatch).
  */
 export function wrapGuwahAfterApprovalForDownstreamAmbiguity(options: {
-  readonly afterApproval: (
-    approved: Readonly<McpToolCallPayload>,
-  ) => CallToolResult | Promise<CallToolResult>;
+  readonly afterApproval: GuwahAfterApprovalHandler;
   readonly isHealthy: () => boolean;
   readonly isReconnecting?: () => boolean;
-}): (
-  approved: Readonly<McpToolCallPayload>,
-) => CallToolResult | Promise<CallToolResult> {
-  return async (approved) => {
+}): GuwahAfterApprovalHandler {
+  return async (approved, context) => {
     const reconnecting = options.isReconnecting?.() === true;
     const beforeState: {
       isHealthy: () => boolean;
@@ -1091,7 +1325,7 @@ export function wrapGuwahAfterApprovalForDownstreamAmbiguity(options: {
     try {
       dispatchStarted = true;
       const dispatchApproved = options.afterApproval;
-      const result = await dispatchApproved(approved);
+      const result = await dispatchApproved(approved, context);
       const afterState: {
         isHealthy: () => boolean;
         isReconnecting?: () => boolean;
@@ -1114,10 +1348,16 @@ export function wrapGuwahAfterApprovalForDownstreamAmbiguity(options: {
         const data = error.data as { guwahCode?: unknown } | undefined;
         if (
           data?.guwahCode === GUWAH_DOWNSTREAM_OUTCOME_UNKNOWN_CODE ||
-          data?.guwahCode === GUWAH_DOWNSTREAM_UNAVAILABLE_CODE
+          data?.guwahCode === GUWAH_DOWNSTREAM_UNAVAILABLE_CODE ||
+          data?.guwahCode === GUWAH_DOWNSTREAM_FAILURE_CODE
         ) {
           throw error;
         }
+        if (isGuwahEmittedMcpError(error)) {
+          throw error;
+        }
+        // Untrusted downstream MCP errors: never forward verbatim messages.
+        throw mapGuwahDownstreamFailureToMcpError(error);
       }
       if (dispatchStarted) {
         const afterState: {
@@ -1136,7 +1376,8 @@ export function wrapGuwahAfterApprovalForDownstreamAmbiguity(options: {
           throw mapGuwahDownstreamDispatchStateToMcpError("outcome-unknown");
         }
       }
-      throw error;
+      // Non-MCP throws from dispatch are sanitized as downstream failures.
+      throw mapGuwahDownstreamFailureToMcpError(error);
     }
   };
 }
@@ -1549,14 +1790,13 @@ export function createGuwahGatewayServer(options?: GuwahGatewayServerOptions): S
     resolveMediatedTools: () => readonly GuwahMediatedTool[];
     beforeResolveMediatedTools?: () => void | Promise<void>;
     guard: GuwahGuard;
-    afterApproval: (
-      approved: Readonly<McpToolCallPayload>,
-    ) => CallToolResult | Promise<CallToolResult>;
+    afterApproval: GuwahAfterApprovalHandler;
     activeRequests: GuwahActiveRequestRegistry;
     requestTimeoutMs?: number;
     maxConcurrentCalls?: number;
     onActiveCountChange?: (activeCount: number) => void;
     isHandshakeComplete: () => boolean;
+    idempotencyEnforcer?: GuwahIdempotencyEnforcer;
   } = {
     resolveMediatedTools,
     guard: resolveGuard(options),
@@ -1575,6 +1815,9 @@ export function createGuwahGatewayServer(options?: GuwahGatewayServerOptions): S
   }
   if (options?.onActiveCountChange !== undefined) {
     callOptions.onActiveCountChange = options.onActiveCountChange;
+  }
+  if (options?.idempotencyEnforcer !== undefined) {
+    callOptions.idempotencyEnforcer = options.idempotencyEnforcer;
   }
   const listOptions =
     options?.beforeResolveMediatedTools === undefined
@@ -1726,9 +1969,8 @@ function buildServerOptionsFromStdio(
     beforeResolveMediatedTools?: () => void | Promise<void>;
     policyPath?: string;
     guard?: GuwahGuard;
-    afterApproval?: (
-      approved: Readonly<McpToolCallPayload>,
-    ) => CallToolResult | Promise<CallToolResult>;
+    afterApproval?: GuwahAfterApprovalHandler;
+    idempotencyEnforcer?: GuwahIdempotencyEnforcer;
     activeRequests?: GuwahActiveRequestRegistry;
     requestTimeoutMs?: number;
     maxConcurrentCalls?: number;
@@ -1750,6 +1992,9 @@ function buildServerOptionsFromStdio(
   }
   if (options.afterApproval !== undefined) {
     serverOptions.afterApproval = options.afterApproval;
+  }
+  if (options.idempotencyEnforcer !== undefined) {
+    serverOptions.idempotencyEnforcer = options.idempotencyEnforcer;
   }
   if (options.activeRequests !== undefined) {
     serverOptions.activeRequests = options.activeRequests;
@@ -1910,7 +2155,7 @@ export async function startGuwahStdioGateway(
         }
       : {}),
     activeRequests,
-    afterApproval: async (approved) => {
+    afterApproval: async (approved, context) => {
       if (!acceptingNewMessages) {
         throw new McpError(ErrorCode.InternalError, "Gateway is shutting down.");
       }
@@ -1921,7 +2166,7 @@ export async function startGuwahStdioGateway(
           throw new McpError(ErrorCode.InternalError, "Gateway is shutting down.");
         }
         // Pre-dispatch unavailability is blocked locally; mid-dispatch death is outcome-unknown.
-        return await guardedAfterApproval(approved);
+        return await guardedAfterApproval(approved, context);
       } finally {
         activeDispatches = Math.max(0, activeDispatches - 1);
         notifyIdle();

@@ -11,20 +11,24 @@ import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
+import { ListToolsRequestSchema, CallToolRequestSchema, ErrorCode, McpError } from "@modelcontextprotocol/sdk/types.js";
 import {
+  callGuwahDownstreamToolWithCancelPropagation,
   connectGuwahDownstream,
   createGuwahDownstreamClient,
   createGuwahDownstreamReconnectGate,
   createGuwahGatewayServer,
   createGuwahStdioTransport,
   classifyGuwahDownstreamDispatchState,
+  classifyGuwahToolSideEffect,
   formatGuwahDiagnosticLine,
   GuwahActiveRequestRegistry,
   GUWAH_DOWNSTREAM_CLIENT_NAME,
   GUWAH_DOWNSTREAM_CLIENT_VERSION,
   GUWAH_DOWNSTREAM_CONNECTION_DEAD_ERROR,
   GUWAH_DOWNSTREAM_CONNECTION_ERROR,
+  GUWAH_DOWNSTREAM_FAILURE_CODE,
+  GUWAH_DOWNSTREAM_FAILURE_ERROR,
   GUWAH_DOWNSTREAM_OUTCOME_UNKNOWN_CODE,
   GUWAH_DOWNSTREAM_OUTCOME_UNKNOWN_ERROR,
   GUWAH_DOWNSTREAM_RECONNECT_FAILED_ERROR,
@@ -34,6 +38,7 @@ import {
   GUWAH_GATEWAY_CAPABILITIES,
   GUWAH_GATEWAY_NAME,
   GUWAH_GATEWAY_VERSION,
+  GUWAH_IDEMPOTENCY_META_KEY,
   GUWAH_STDIO_BACKPRESSURE_BOUNDS,
   GUWAH_TOOL_COLLISION_ERROR,
   GUWAH_TOOL_NAMESPACE_ERROR,
@@ -44,8 +49,12 @@ import {
   detectGuwahDiscoveryListChange,
   discoverGuwahDownstreamTools,
   fingerprintGuwahDiscoveryList,
+  guwahMayCoalesceMutatingCall,
+  guwahToolAllowsAutomaticRetry,
+  isGuwahEmittedMcpError,
   loadGuwahDownstreamTransportConfig,
   mapGuwahDownstreamDispatchStateToMcpError,
+  mapGuwahDownstreamFailureToMcpError,
   mapGuwahViolationToMcpError,
   mirrorAuthorizedGuwahTools,
   namespaceGuwahToolName,
@@ -56,6 +65,7 @@ import {
   remirrorGuwahToolsFromDiscovery,
   redactGuwahDiagnosticText,
   resolveGuwahDownstreamTransportConfig,
+  resolveGuwahIdempotencyKey,
   sealGuwahRequestsForFailClosedReconnect,
   startGuwahStdioGateway,
   wrapGuwahAfterApprovalForDownstreamAmbiguity,
@@ -68,6 +78,10 @@ import {
   type GuwahViolationCode,
   type McpToolCallPayload,
 } from "../src/guwahGuard.js";
+import {
+  GuwahFakeDownstreamServer,
+  startGuwahFakeDownstream,
+} from "./guwahFakeDownstream.js";
 
 const REPO_ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
 const GATEWAY_ENTRY = path.join(REPO_ROOT, "dist", "guwahGateway.js");
@@ -3516,6 +3530,174 @@ describe("forward only the exact approved copy", () => {
 
     expect(approvedArgsJson).toBe(expectedDownstreamJson);
     expect(downstreamArgsJson).toBe(expectedDownstreamJson);
+    expect(callerArgs.amountMinor).toBe(9999);
+
+    await client.close();
+    await server.close();
+  });
+});
+
+describe("approved forwarding", () => {
+  const TOOL_NAME = "coinbase_cdp_transfer";
+  const WHITELISTED_DESTINATION = "0x1111111111111111111111111111111111111111";
+
+  const TRANSFER_SCHEMA = {
+    $schema: "http://json-schema.org/draft-07/schema#",
+    type: "object",
+    additionalProperties: false,
+    required: ["amountMinor", "assetId", "destinationAddress", "memo"],
+    properties: {
+      amountMinor: { type: "integer", minimum: 1, maximum: 5000 },
+      assetId: { type: "string", enum: ["USDC"] },
+      destinationAddress: {
+        type: "string",
+        pattern: "^0x[0-9a-fA-F]{40}$",
+        enum: [WHITELISTED_DESTINATION],
+      },
+      memo: {
+        type: "string",
+        minLength: 1,
+        maxLength: 80,
+        pattern: "^[A-Za-z0-9 .,_:-]+$",
+      },
+    },
+  } as const;
+
+  const mediatedTransfer: GuwahMediatedTool = {
+    name: TOOL_NAME,
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      required: ["amountMinor", "assetId", "destinationAddress", "memo"],
+      properties: {
+        amountMinor: { type: "integer" },
+        assetId: { type: "string" },
+        destinationAddress: { type: "string" },
+        memo: { type: "string" },
+      },
+    },
+  };
+
+  function compliantArgs(): Record<string, unknown> {
+    return {
+      amountMinor: 2500,
+      assetId: "USDC",
+      destinationAddress: WHITELISTED_DESTINATION,
+      memo: "invoice 42",
+    };
+  }
+
+  const policyDirs: string[] = [];
+  const liveFixtures: GuwahFakeDownstreamServer[] = [];
+
+  afterEach(async () => {
+    while (liveFixtures.length > 0) {
+      const fixture = liveFixtures.pop();
+      if (fixture !== undefined) {
+        await fixture.stop();
+      }
+    }
+    for (const dir of policyDirs.splice(0, policyDirs.length)) {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  function writePolicy(): string {
+    const dir = mkdtempSync(path.join(tmpdir(), "guwah-approved-forward-"));
+    policyDirs.push(dir);
+    const policyPath = path.join(dir, "guwah-policy.json");
+    writeFileSync(
+      policyPath,
+      `${JSON.stringify(
+        {
+          version: "1.0.0",
+          posture: "default-deny",
+          tools: {
+            [TOOL_NAME]: {
+              action: "ENFORCE",
+              argsSchema: structuredClone(TRANSFER_SCHEMA),
+            },
+          },
+        },
+        null,
+        2,
+      )}\n`,
+      "utf8",
+    );
+    return policyPath;
+  }
+
+  it("compliant call reaches fake downstream once with approved args", async () => {
+    const policyPath = writePolicy();
+    const callerArgs = compliantArgs();
+    const expectedArgsJson = JSON.stringify(compliantArgs());
+
+    const { fixture, connection } = await startGuwahFakeDownstream({
+      tools: [
+        {
+          name: TOOL_NAME,
+          description: "Fake transfer",
+          inputSchema: mediatedTransfer.inputSchema,
+        },
+      ],
+    });
+    liveFixtures.push(fixture);
+
+    const server = createGuwahGatewayServer({
+      policyPath,
+      mediatedTools: [mediatedTransfer],
+      afterApproval: async (approved, context) => {
+        expect(Object.isFrozen(approved.params.arguments as object)).toBe(true);
+        // Caller mutation after approval must not affect the forwarded snapshot.
+        callerArgs.amountMinor = 9999;
+        callerArgs["injected"] = "drift";
+
+        const args = approved.params.arguments;
+        const callOptions: {
+          client: typeof connection.client;
+          name: string;
+          signal: AbortSignal;
+          arguments?: Record<string, unknown>;
+          tool: GuwahMediatedTool;
+        } = {
+          client: connection.client,
+          name: approved.params.name,
+          signal: context.signal,
+          tool: mediatedTransfer,
+        };
+        if (
+          args !== undefined &&
+          typeof args === "object" &&
+          args !== null &&
+          !Array.isArray(args)
+        ) {
+          callOptions.arguments = args as Record<string, unknown>;
+        }
+        return await callGuwahDownstreamToolWithCancelPropagation(callOptions);
+      },
+    });
+
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    const client = new Client({ name: "guwah-approved-forward", version: "0.0.0" });
+    await server.connect(serverTransport);
+    await client.connect(clientTransport);
+
+    expect(fixture.getInvocationCount()).toBe(0);
+    const result = await client.callTool({
+      name: TOOL_NAME,
+      arguments: callerArgs,
+    });
+
+    expect(result).toMatchObject({
+      content: [{ type: "text", text: `fake-ok:${TOOL_NAME}` }],
+    });
+    expect(fixture.getInvocationCount()).toBe(1);
+    expect(fixture.getInvocations()).toHaveLength(1);
+    const invocation = fixture.getInvocations()[0];
+    expect(invocation?.name).toBe(TOOL_NAME);
+    expect(JSON.stringify(invocation?.arguments)).toBe(expectedArgsJson);
+    expect(JSON.stringify(invocation?.arguments)).not.toContain("9999");
+    expect(JSON.stringify(invocation?.arguments)).not.toContain("injected");
     expect(callerArgs.amountMinor).toBe(9999);
 
     await client.close();
@@ -7595,6 +7777,336 @@ describe("MCP cancellation", () => {
     await clientTransport.close();
   });
 
+  it("forwards cancel downstream when a request is active without a second tools/call", async () => {
+    const policyPath = writePolicy();
+    const activeRequests = new GuwahActiveRequestRegistry();
+
+    let releaseDownstream: (() => void) | undefined;
+    const holdDownstream = new Promise<void>((resolve) => {
+      releaseDownstream = resolve;
+    });
+    let downstreamToolCalls = 0;
+    const downstreamCancelled: unknown[] = [];
+
+    const downstreamServer = new Server(
+      { name: "guwah-downstream-cancel", version: "0.0.0" },
+      { capabilities: { tools: {} } },
+    );
+    downstreamServer.setRequestHandler(ListToolsRequestSchema, async () => ({
+      tools: [
+        {
+          name: TOOL_NAME,
+          inputSchema: mediatedTransfer.inputSchema,
+        },
+      ],
+    }));
+    downstreamServer.setRequestHandler(CallToolRequestSchema, async () => {
+      downstreamToolCalls += 1;
+      await holdDownstream;
+      return { content: [{ type: "text", text: "late-downstream-success" }] };
+    });
+
+    const [downstreamClientTransport, downstreamServerTransport] = InMemoryTransport.createLinkedPair();
+    await downstreamServer.connect(downstreamServerTransport);
+    const serverMessageHandler = downstreamServerTransport.onmessage;
+    downstreamServerTransport.onmessage = (message) => {
+      if (
+        typeof message === "object" &&
+        message !== null &&
+        "method" in message &&
+        (message as { method: unknown }).method === "notifications/cancelled"
+      ) {
+        downstreamCancelled.push(message);
+      }
+      serverMessageHandler?.(message);
+    };
+
+    const downstreamClient = createGuwahDownstreamClient();
+    await downstreamClient.connect(downstreamClientTransport);
+
+    let dispatchCount = 0;
+    const server = createGuwahGatewayServer({
+      policyPath,
+      mediatedTools: [mediatedTransfer],
+      activeRequests,
+      afterApproval: async (approved, context) => {
+        dispatchCount += 1;
+        const args = approved.params.arguments;
+        const callOptions: {
+          client: typeof downstreamClient;
+          name: string;
+          signal: AbortSignal;
+          arguments?: Record<string, unknown>;
+        } = {
+          client: downstreamClient,
+          name: approved.params.name,
+          signal: context.signal,
+        };
+        if (
+          args !== undefined &&
+          typeof args === "object" &&
+          args !== null &&
+          !Array.isArray(args)
+        ) {
+          callOptions.arguments = args as Record<string, unknown>;
+        }
+        return await callGuwahDownstreamToolWithCancelPropagation(callOptions);
+      },
+    });
+
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await server.connect(serverTransport);
+    await clientTransport.start();
+
+    const responses: unknown[] = [];
+    clientTransport.onmessage = (message) => {
+      responses.push(message);
+    };
+
+    await clientTransport.send({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "initialize",
+      params: {
+        protocolVersion: "2025-11-25",
+        capabilities: {},
+        clientInfo: { name: "guwah-cancel-propagate", version: "0.0.0" },
+      },
+    });
+    const initDeadline = Date.now() + 5000;
+    while (Date.now() < initDeadline && responses.length === 0) {
+      await new Promise((resolve) => {
+        setTimeout(resolve, 25);
+      });
+    }
+    await clientTransport.send({
+      jsonrpc: "2.0",
+      method: "notifications/initialized",
+    });
+
+    await clientTransport.send({
+      jsonrpc: "2.0",
+      id: 91,
+      method: "tools/call",
+      params: { name: TOOL_NAME, arguments: compliantArgs() },
+    });
+    const enteredDeadline = Date.now() + 5000;
+    while (Date.now() < enteredDeadline && downstreamToolCalls === 0) {
+      await new Promise((resolve) => {
+        setTimeout(resolve, 25);
+      });
+    }
+    expect(downstreamToolCalls).toBe(1);
+    expect(dispatchCount).toBe(1);
+
+    await clientTransport.send({
+      jsonrpc: "2.0",
+      method: "notifications/cancelled",
+      params: { requestId: 91, reason: "host cancelled" },
+    });
+
+    const cancelDeadline = Date.now() + 5000;
+    while (Date.now() < cancelDeadline && downstreamCancelled.length === 0) {
+      await new Promise((resolve) => {
+        setTimeout(resolve, 25);
+      });
+    }
+    expect(downstreamCancelled.length).toBeGreaterThanOrEqual(1);
+    expect(downstreamCancelled[0]).toMatchObject({
+      jsonrpc: "2.0",
+      method: "notifications/cancelled",
+    });
+    expect(dispatchCount).toBe(1);
+    expect(downstreamToolCalls).toBe(1);
+
+    releaseDownstream?.();
+    await new Promise((resolve) => {
+      setTimeout(resolve, 150);
+    });
+
+    const lateSuccess = responses.some(
+      (message) =>
+        typeof message === "object" &&
+        message !== null &&
+        "id" in message &&
+        (message as { id: unknown }).id === 91 &&
+        "result" in message,
+    );
+    expect(lateSuccess).toBe(false);
+    expect(JSON.stringify(responses)).not.toContain("late-downstream-success");
+    expect(dispatchCount).toBe(1);
+    expect(downstreamToolCalls).toBe(1);
+
+    await server.close();
+    await clientTransport.close();
+    await downstreamClient.close();
+    await downstreamServer.close();
+  });
+
+  it("suppresses late success without retry when downstream cancel is unsupported", async () => {
+    const policyPath = writePolicy();
+    const activeRequests = new GuwahActiveRequestRegistry();
+    let releaseDispatch: (() => void) | undefined;
+    const holdDispatch = new Promise<void>((resolve) => {
+      releaseDispatch = resolve;
+    });
+    let dispatchCount = 0;
+    let observedSignalAborted = false;
+
+    const server = createGuwahGatewayServer({
+      policyPath,
+      mediatedTools: [mediatedTransfer],
+      activeRequests,
+      afterApproval: async (_approved, context) => {
+        dispatchCount += 1;
+        // Downstream does not honor cancel; dispatch continues until local completion.
+        const waitStart = Date.now();
+        while (Date.now() - waitStart < 5000 && !context.signal.aborted) {
+          await new Promise((resolve) => {
+            setTimeout(resolve, 25);
+          });
+        }
+        observedSignalAborted = context.signal.aborted;
+        await holdDispatch;
+        return { content: [{ type: "text", text: "unsupported-cancel-late-success" }] };
+      },
+    });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await server.connect(serverTransport);
+    await clientTransport.start();
+
+    const responses: unknown[] = [];
+    clientTransport.onmessage = (message) => {
+      responses.push(message);
+    };
+
+    await clientTransport.send({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "initialize",
+      params: {
+        protocolVersion: "2025-11-25",
+        capabilities: {},
+        clientInfo: { name: "guwah-cancel-unsupported", version: "0.0.0" },
+      },
+    });
+    const initDeadline = Date.now() + 5000;
+    while (Date.now() < initDeadline && responses.length === 0) {
+      await new Promise((resolve) => {
+        setTimeout(resolve, 25);
+      });
+    }
+    await clientTransport.send({
+      jsonrpc: "2.0",
+      method: "notifications/initialized",
+    });
+
+    await clientTransport.send({
+      jsonrpc: "2.0",
+      id: 92,
+      method: "tools/call",
+      params: { name: TOOL_NAME, arguments: compliantArgs() },
+    });
+    const enteredDeadline = Date.now() + 5000;
+    while (Date.now() < enteredDeadline && dispatchCount === 0) {
+      await new Promise((resolve) => {
+        setTimeout(resolve, 25);
+      });
+    }
+    expect(dispatchCount).toBe(1);
+
+    await clientTransport.send({
+      jsonrpc: "2.0",
+      method: "notifications/cancelled",
+      params: { requestId: 92, reason: "host cancelled" },
+    });
+    const cancelledDeadline = Date.now() + 5000;
+    while (Date.now() < cancelledDeadline && !activeRequests.isCancelled(92)) {
+      await new Promise((resolve) => {
+        setTimeout(resolve, 25);
+      });
+    }
+    expect(activeRequests.isCancelled(92)).toBe(true);
+
+    releaseDispatch?.();
+    await new Promise((resolve) => {
+      setTimeout(resolve, 150);
+    });
+
+    expect(observedSignalAborted).toBe(true);
+    expect(dispatchCount).toBe(1);
+    const lateSuccess = responses.some(
+      (message) =>
+        typeof message === "object" &&
+        message !== null &&
+        "id" in message &&
+        (message as { id: unknown }).id === 92 &&
+        "result" in message,
+    );
+    expect(lateSuccess).toBe(false);
+    expect(JSON.stringify(responses)).not.toContain("unsupported-cancel-late-success");
+
+    await server.close();
+    await clientTransport.close();
+  });
+
+  it("does not retry callTool when cancel aborts an in-flight downstream request", async () => {
+    let callCount = 0;
+    const controller = new AbortController();
+    const fakeClient = {
+      callTool: async (
+        _params: unknown,
+        _schema?: unknown,
+        options?: { signal?: AbortSignal },
+      ) => {
+        callCount += 1;
+        expect(options?.signal).toBe(controller.signal);
+        await new Promise<never>((_resolve, reject) => {
+          const onAbort = (): void => {
+            reject(new Error("aborted"));
+          };
+          if (options?.signal?.aborted) {
+            onAbort();
+            return;
+          }
+          options?.signal?.addEventListener("abort", onAbort, { once: true });
+        });
+      },
+    };
+
+    const pending = callGuwahDownstreamToolWithCancelPropagation({
+      client: fakeClient as unknown as Pick<Client, "callTool">,
+      name: TOOL_NAME,
+      arguments: compliantArgs(),
+      signal: controller.signal,
+    });
+    controller.abort();
+    await expect(pending).rejects.toThrow();
+    expect(callCount).toBe(1);
+  });
+
+  it("discards a late callTool success when the cancel signal is already aborted", async () => {
+    const LATE_SECRET = "late-body-secret-must-not-return";
+    const controller = new AbortController();
+    controller.abort();
+    const fakeClient = {
+      callTool: async () => ({
+        content: [{ type: "text", text: LATE_SECRET }],
+      }),
+    };
+
+    await expect(
+      callGuwahDownstreamToolWithCancelPropagation({
+        client: fakeClient as unknown as Pick<Client, "callTool">,
+        name: TOOL_NAME,
+        arguments: compliantArgs(),
+        signal: controller.signal,
+      }),
+    ).rejects.toMatchObject({
+      message: expect.stringContaining("no longer active"),
+    });
+  });
+
   it("does not dispatch afterApproval when cancelled before approval", async () => {
     const policyPath = writePolicy();
     const activeRequests = new GuwahActiveRequestRegistry();
@@ -7943,6 +8455,594 @@ describe("request deadlines", () => {
         "result" in message,
     );
     expect(lateSuccess).toBe(false);
+
+    await server.close();
+    await clientTransport.close();
+  });
+});
+
+describe("mutating call retry prohibition", () => {
+  const TOOL_NAME = "coinbase_cdp_transfer";
+  const WHITELISTED_DESTINATION = "0x1111111111111111111111111111111111111111";
+
+  const TRANSFER_SCHEMA = {
+    $schema: "http://json-schema.org/draft-07/schema#",
+    type: "object",
+    additionalProperties: false,
+    required: ["amountMinor", "assetId", "destinationAddress", "memo"],
+    properties: {
+      amountMinor: { type: "integer", minimum: 1, maximum: 5000 },
+      assetId: { type: "string", enum: ["USDC"] },
+      destinationAddress: {
+        type: "string",
+        pattern: "^0x[0-9a-fA-F]{40}$",
+        enum: [WHITELISTED_DESTINATION],
+      },
+      memo: {
+        type: "string",
+        minLength: 1,
+        maxLength: 80,
+        pattern: "^[A-Za-z0-9 .,_:-]+$",
+      },
+    },
+  } as const;
+
+  const mediatedTransfer: GuwahMediatedTool = {
+    name: TOOL_NAME,
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      required: ["amountMinor", "assetId", "destinationAddress", "memo"],
+      properties: {
+        amountMinor: { type: "integer" },
+        assetId: { type: "string" },
+        destinationAddress: { type: "string" },
+        memo: { type: "string" },
+      },
+    },
+  };
+
+  function compliantArgs(): Record<string, unknown> {
+    return {
+      amountMinor: 5000,
+      assetId: "USDC",
+      destinationAddress: WHITELISTED_DESTINATION,
+      memo: "invoice 1001",
+    };
+  }
+
+  const policyDirs: string[] = [];
+
+  afterEach(() => {
+    for (const dir of policyDirs.splice(0, policyDirs.length)) {
+      rmSync(dir, { recursive: true, force: true });
+    }
+    vi.restoreAllMocks();
+  });
+
+  function writePolicy(): string {
+    const dir = mkdtempSync(path.join(tmpdir(), "guwah-mutating-retry-"));
+    policyDirs.push(dir);
+    const policyPath = path.join(dir, "guwah-policy.json");
+    writeFileSync(
+      policyPath,
+      `${JSON.stringify(
+        {
+          version: "1.0.0",
+          posture: "default-deny",
+          tools: {
+            [TOOL_NAME]: {
+              action: "ENFORCE",
+              argsSchema: structuredClone(TRANSFER_SCHEMA),
+            },
+          },
+        },
+        null,
+        2,
+      )}\n`,
+      "utf8",
+    );
+    return policyPath;
+  }
+
+  it("treats unclassified tools and the sample transfer as mutating without automatic retry", () => {
+    expect(classifyGuwahToolSideEffect(undefined)).toBe("mutating");
+    expect(classifyGuwahToolSideEffect(mediatedTransfer)).toBe("mutating");
+    expect(classifyGuwahToolSideEffect({ sideEffectClass: "mutating" })).toBe("mutating");
+    expect(classifyGuwahToolSideEffect({ sideEffectClass: "read-only" })).toBe("read-only");
+    expect(guwahToolAllowsAutomaticRetry(undefined)).toBe(false);
+    expect(guwahToolAllowsAutomaticRetry(mediatedTransfer)).toBe(false);
+    expect(guwahToolAllowsAutomaticRetry({ sideEffectClass: "read-only" })).toBe(false);
+  });
+
+  it("timeout shows a single downstream dispatch attempt for a mutating transfer", async () => {
+    const policyPath = writePolicy();
+    const activeRequests = new GuwahActiveRequestRegistry();
+    let callToolCount = 0;
+    const controllerSeen: AbortSignal[] = [];
+
+    const fakeClient = {
+      callTool: async (
+        _params: unknown,
+        _schema?: unknown,
+        options?: { signal?: AbortSignal },
+      ) => {
+        callToolCount += 1;
+        if (options?.signal !== undefined) {
+          controllerSeen.push(options.signal);
+        }
+        await new Promise<never>((_resolve, reject) => {
+          const onAbort = (): void => {
+            reject(new Error("downstream timed out"));
+          };
+          if (options?.signal?.aborted) {
+            onAbort();
+            return;
+          }
+          options?.signal?.addEventListener("abort", onAbort, { once: true });
+        });
+      },
+    };
+
+    const server = createGuwahGatewayServer({
+      policyPath,
+      mediatedTools: [mediatedTransfer],
+      activeRequests,
+      requestTimeoutMs: 40,
+      afterApproval: async (approved, context) =>
+        callGuwahDownstreamToolWithCancelPropagation({
+          client: fakeClient as unknown as Pick<Client, "callTool">,
+          name: approved.params.name,
+          arguments: compliantArgs(),
+          signal: context.signal,
+          tool: mediatedTransfer,
+        }),
+    });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await server.connect(serverTransport);
+    await clientTransport.start();
+
+    const responses: unknown[] = [];
+    clientTransport.onmessage = (message) => {
+      responses.push(message);
+    };
+
+    await clientTransport.send({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "initialize",
+      params: {
+        protocolVersion: "2025-11-25",
+        capabilities: {},
+        clientInfo: { name: "guwah-mutating-timeout", version: "0.0.0" },
+      },
+    });
+    const initDeadline = Date.now() + 5000;
+    while (Date.now() < initDeadline && responses.length === 0) {
+      await new Promise((resolve) => {
+        setTimeout(resolve, 25);
+      });
+    }
+    await clientTransport.send({
+      jsonrpc: "2.0",
+      method: "notifications/initialized",
+    });
+
+    await clientTransport.send({
+      jsonrpc: "2.0",
+      id: 301,
+      method: "tools/call",
+      params: { name: TOOL_NAME, arguments: compliantArgs() },
+    });
+
+    const startedDeadline = Date.now() + 5000;
+    while (Date.now() < startedDeadline && callToolCount === 0) {
+      await new Promise((resolve) => {
+        setTimeout(resolve, 10);
+      });
+    }
+    expect(callToolCount).toBe(1);
+
+    const finishedDeadline = Date.now() + 5000;
+    while (Date.now() < finishedDeadline && activeRequests.has(301)) {
+      await new Promise((resolve) => {
+        setTimeout(resolve, 25);
+      });
+    }
+    expect(activeRequests.has(301)).toBe(false);
+    expect(callToolCount).toBe(1);
+    expect(controllerSeen).toHaveLength(1);
+    expect(controllerSeen[0]?.aborted).toBe(true);
+
+    const successes = responses.filter(
+      (message) =>
+        typeof message === "object" &&
+        message !== null &&
+        "id" in message &&
+        (message as { id: unknown }).id === 301 &&
+        "result" in message,
+    );
+    expect(successes).toHaveLength(0);
+
+    await server.close();
+    await clientTransport.close();
+  });
+
+  it("disconnect shows a single downstream dispatch attempt for a mutating transfer", async () => {
+    const policyPath = writePolicy();
+    let callToolCount = 0;
+    let releaseCall: (() => void) | undefined;
+    const holdCall = new Promise<void>((resolve) => {
+      releaseCall = resolve;
+    });
+    let healthy = true;
+
+    const fakeClient = {
+      callTool: async () => {
+        callToolCount += 1;
+        await holdCall;
+        throw new Error("connection reset");
+      },
+    };
+
+    const server = createGuwahGatewayServer({
+      policyPath,
+      mediatedTools: [mediatedTransfer],
+      afterApproval: wrapGuwahAfterApprovalForDownstreamAmbiguity({
+        isHealthy: () => healthy,
+        afterApproval: async (approved, context) =>
+          callGuwahDownstreamToolWithCancelPropagation({
+            client: fakeClient as unknown as Pick<Client, "callTool">,
+            name: approved.params.name,
+            arguments: compliantArgs(),
+            signal: context.signal,
+            tool: mediatedTransfer,
+          }),
+      }),
+    });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    const client = new Client({ name: "guwah-mutating-disconnect", version: "0.0.0" });
+    await server.connect(serverTransport);
+    await client.connect(clientTransport);
+
+    const pending = client.callTool({
+      name: TOOL_NAME,
+      arguments: compliantArgs(),
+    });
+
+    const startedDeadline = Date.now() + 5000;
+    while (Date.now() < startedDeadline && callToolCount === 0) {
+      await new Promise((resolve) => {
+        setTimeout(resolve, 25);
+      });
+    }
+    expect(callToolCount).toBe(1);
+
+    healthy = false;
+    releaseCall?.();
+    await expect(pending).rejects.toThrow();
+    expect(callToolCount).toBe(1);
+
+    await client.close();
+    await server.close();
+  });
+
+  it("host retries use a new request id and must re-validate", async () => {
+    const policyPath = writePolicy();
+    const guard = new GuwahGuard({ policyPath });
+    const validateSpy = vi.spyOn(guard, "validateToolCall");
+    let dispatchCount = 0;
+
+    const server = createGuwahGatewayServer({
+      guard,
+      mediatedTools: [mediatedTransfer],
+      afterApproval: async () => {
+        dispatchCount += 1;
+        return { content: [{ type: "text", text: `ok-${dispatchCount}` }] };
+      },
+    });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    const client = new Client({ name: "guwah-host-retry", version: "0.0.0" });
+    await server.connect(serverTransport);
+    await client.connect(clientTransport);
+
+    await client.callTool({ name: TOOL_NAME, arguments: compliantArgs() });
+    await client.callTool({ name: TOOL_NAME, arguments: compliantArgs() });
+
+    expect(dispatchCount).toBe(2);
+    expect(validateSpy).toHaveBeenCalledTimes(2);
+    const firstId = (validateSpy.mock.calls[0]?.[0] as { id?: unknown } | undefined)?.id;
+    const secondId = (validateSpy.mock.calls[1]?.[0] as { id?: unknown } | undefined)?.id;
+    expect(firstId).not.toBe(secondId);
+
+    await client.close();
+    await server.close();
+  });
+});
+
+describe("idempotency controls", () => {
+  const TOOL_NAME = "coinbase_cdp_transfer";
+  const WHITELISTED_DESTINATION = "0x1111111111111111111111111111111111111111";
+
+  const TRANSFER_SCHEMA = {
+    $schema: "http://json-schema.org/draft-07/schema#",
+    type: "object",
+    additionalProperties: false,
+    required: ["amountMinor", "assetId", "destinationAddress", "memo"],
+    properties: {
+      amountMinor: { type: "integer", minimum: 1, maximum: 5000 },
+      assetId: { type: "string", enum: ["USDC"] },
+      destinationAddress: {
+        type: "string",
+        pattern: "^0x[0-9a-fA-F]{40}$",
+        enum: [WHITELISTED_DESTINATION],
+      },
+      memo: {
+        type: "string",
+        minLength: 1,
+        maxLength: 80,
+        pattern: "^[A-Za-z0-9 .,_:-]+$",
+      },
+    },
+  } as const;
+
+  const mediatedTransfer: GuwahMediatedTool = {
+    name: TOOL_NAME,
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      required: ["amountMinor", "assetId", "destinationAddress", "memo"],
+      properties: {
+        amountMinor: { type: "integer" },
+        assetId: { type: "string" },
+        destinationAddress: { type: "string" },
+        memo: { type: "string" },
+      },
+    },
+  };
+
+  function compliantArgs(): Record<string, unknown> {
+    return {
+      amountMinor: 5000,
+      assetId: "USDC",
+      destinationAddress: WHITELISTED_DESTINATION,
+      memo: "invoice 1001",
+    };
+  }
+
+  const policyDirs: string[] = [];
+
+  afterEach(() => {
+    for (const dir of policyDirs.splice(0, policyDirs.length)) {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  function writePolicy(): string {
+    const dir = mkdtempSync(path.join(tmpdir(), "guwah-idempotency-"));
+    policyDirs.push(dir);
+    const policyPath = path.join(dir, "guwah-policy.json");
+    writeFileSync(
+      policyPath,
+      `${JSON.stringify(
+        {
+          version: "1.0.0",
+          posture: "default-deny",
+          tools: {
+            [TOOL_NAME]: {
+              action: "ENFORCE",
+              argsSchema: structuredClone(TRANSFER_SCHEMA),
+            },
+          },
+        },
+        null,
+        2,
+      )}\n`,
+      "utf8",
+    );
+    return policyPath;
+  }
+
+  it("requires an explicit key and enforcer before coalescing is allowed", () => {
+    expect(resolveGuwahIdempotencyKey(undefined)).toBeUndefined();
+    expect(resolveGuwahIdempotencyKey({})).toBeUndefined();
+    expect(resolveGuwahIdempotencyKey({ [GUWAH_IDEMPOTENCY_META_KEY]: "  " })).toBeUndefined();
+    expect(resolveGuwahIdempotencyKey({ [GUWAH_IDEMPOTENCY_META_KEY]: "xfer-1" })).toBe("xfer-1");
+    expect(
+      guwahMayCoalesceMutatingCall({ idempotencyKey: undefined, enforcerConfigured: true }),
+    ).toBe(false);
+    expect(
+      guwahMayCoalesceMutatingCall({ idempotencyKey: "xfer-1", enforcerConfigured: false }),
+    ).toBe(false);
+    expect(
+      guwahMayCoalesceMutatingCall({ idempotencyKey: "xfer-1", enforcerConfigured: true }),
+    ).toBe(true);
+  });
+
+  it("duplicate-request: absent key plus duplicate payload does not auto-deduplicate a transfer", async () => {
+    const policyPath = writePolicy();
+    let dispatchCount = 0;
+    const tryReuse = vi.fn((_key?: string) => ({
+      content: [{ type: "text" as const, text: "should-not-reuse-without-key" }],
+    }));
+
+    const server = createGuwahGatewayServer({
+      policyPath,
+      mediatedTools: [mediatedTransfer],
+      // Enforcer present but unused without an explicit key — silent payload coalescing is forbidden.
+      idempotencyEnforcer: { tryReuse },
+      afterApproval: async () => {
+        dispatchCount += 1;
+        return { content: [{ type: "text", text: `dispatch-${dispatchCount}` }] };
+      },
+    });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    const client = new Client({ name: "guwah-dup-payload", version: "0.0.0" });
+    await server.connect(serverTransport);
+    await client.connect(clientTransport);
+
+    const args = compliantArgs();
+    const first = await client.callTool({ name: TOOL_NAME, arguments: args });
+    const second = await client.callTool({ name: TOOL_NAME, arguments: structuredClone(args) });
+
+    expect(dispatchCount).toBe(2);
+    expect(tryReuse).not.toHaveBeenCalled();
+    expect(first).toMatchObject({ content: [{ type: "text", text: "dispatch-1" }] });
+    expect(second).toMatchObject({ content: [{ type: "text", text: "dispatch-2" }] });
+
+    await client.close();
+    await server.close();
+  });
+
+  it("duplicate-request: concurrent identical payloads without a key each dispatch once", async () => {
+    const policyPath = writePolicy();
+    let dispatchCount = 0;
+    let releaseGate: (() => void) | undefined;
+    const gate = new Promise<void>((resolve) => {
+      releaseGate = resolve;
+    });
+    let entered = 0;
+
+    const server = createGuwahGatewayServer({
+      policyPath,
+      mediatedTools: [mediatedTransfer],
+      afterApproval: async () => {
+        entered += 1;
+        if (entered === 2) {
+          releaseGate?.();
+        }
+        await gate;
+        dispatchCount += 1;
+        return { content: [{ type: "text", text: `concurrent-${dispatchCount}` }] };
+      },
+    });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    const client = new Client({ name: "guwah-dup-concurrent", version: "0.0.0" });
+    await server.connect(serverTransport);
+    await client.connect(clientTransport);
+
+    const args = compliantArgs();
+    const [a, b] = await Promise.all([
+      client.callTool({ name: TOOL_NAME, arguments: args }),
+      client.callTool({ name: TOOL_NAME, arguments: structuredClone(args) }),
+    ]);
+
+    expect(dispatchCount).toBe(2);
+    expect(entered).toBe(2);
+    expect(a).toBeDefined();
+    expect(b).toBeDefined();
+
+    await client.close();
+    await server.close();
+  });
+
+  it("duplicate-request: explicit key with enforcer may reuse; key alone does not", async () => {
+    const policyPath = writePolicy();
+    let dispatchCount = 0;
+    const prior = {
+      content: [{ type: "text" as const, text: "reused-under-key" }],
+    };
+    const tryReuse = vi.fn((key: string) => (key === "xfer-42" ? prior : undefined));
+
+    const server = createGuwahGatewayServer({
+      policyPath,
+      mediatedTools: [mediatedTransfer],
+      idempotencyEnforcer: { tryReuse },
+      afterApproval: async () => {
+        dispatchCount += 1;
+        return { content: [{ type: "text", text: `fresh-${dispatchCount}` }] };
+      },
+    });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await server.connect(serverTransport);
+    await clientTransport.start();
+
+    const responses: unknown[] = [];
+    clientTransport.onmessage = (message) => {
+      responses.push(message);
+    };
+
+    await clientTransport.send({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "initialize",
+      params: {
+        protocolVersion: "2025-11-25",
+        capabilities: {},
+        clientInfo: { name: "guwah-idem-key", version: "0.0.0" },
+      },
+    });
+    const initDeadline = Date.now() + 5000;
+    while (Date.now() < initDeadline && responses.length === 0) {
+      await new Promise((resolve) => {
+        setTimeout(resolve, 25);
+      });
+    }
+    await clientTransport.send({
+      jsonrpc: "2.0",
+      method: "notifications/initialized",
+    });
+
+    await clientTransport.send({
+      jsonrpc: "2.0",
+      id: 10,
+      method: "tools/call",
+      params: {
+        name: TOOL_NAME,
+        arguments: compliantArgs(),
+        _meta: { [GUWAH_IDEMPOTENCY_META_KEY]: "xfer-42" },
+      },
+    });
+    const reusedDeadline = Date.now() + 5000;
+    while (
+      Date.now() < reusedDeadline &&
+      !responses.some(
+        (message) =>
+          typeof message === "object" &&
+          message !== null &&
+          "id" in message &&
+          (message as { id: unknown }).id === 10 &&
+          "result" in message,
+      )
+    ) {
+      await new Promise((resolve) => {
+        setTimeout(resolve, 25);
+      });
+    }
+
+    expect(tryReuse).toHaveBeenCalledWith("xfer-42");
+    expect(dispatchCount).toBe(0);
+    expect(JSON.stringify(responses)).toContain("reused-under-key");
+
+    await clientTransport.send({
+      jsonrpc: "2.0",
+      id: 11,
+      method: "tools/call",
+      params: {
+        name: TOOL_NAME,
+        arguments: compliantArgs(),
+        _meta: { [GUWAH_IDEMPOTENCY_META_KEY]: "xfer-99" },
+      },
+    });
+    const freshDeadline = Date.now() + 5000;
+    while (
+      Date.now() < freshDeadline &&
+      !responses.some(
+        (message) =>
+          typeof message === "object" &&
+          message !== null &&
+          "id" in message &&
+          (message as { id: unknown }).id === 11 &&
+          "result" in message,
+      )
+    ) {
+      await new Promise((resolve) => {
+        setTimeout(resolve, 25);
+      });
+    }
+
+    expect(dispatchCount).toBe(1);
+    expect(JSON.stringify(responses)).toContain("fresh-1");
 
     await server.close();
     await clientTransport.close();
@@ -8353,6 +9453,149 @@ describe("late response suppression", () => {
       expect(successAfterError).toBe(false);
     }
   });
+
+  it("delayed-response: discards late downstream body after deadline without logging secrets", async () => {
+    const LATE_SECRET = "late-downstream-secret-token-do-not-leak";
+    const policyPath = writePolicy();
+    const activeRequests = new GuwahActiveRequestRegistry();
+
+    let releaseDownstream: (() => void) | undefined;
+    const holdDownstream = new Promise<void>((resolve) => {
+      releaseDownstream = resolve;
+    });
+    let downstreamToolCalls = 0;
+
+    const downstreamServer = new Server(
+      { name: "guwah-downstream-late", version: "0.0.0" },
+      { capabilities: { tools: {} } },
+    );
+    downstreamServer.setRequestHandler(ListToolsRequestSchema, async () => ({
+      tools: [
+        {
+          name: TOOL_NAME,
+          inputSchema: mediatedTransfer.inputSchema,
+        },
+      ],
+    }));
+    downstreamServer.setRequestHandler(CallToolRequestSchema, async () => {
+      downstreamToolCalls += 1;
+      await holdDownstream;
+      return {
+        content: [{ type: "text", text: `approved:${LATE_SECRET}` }],
+      };
+    });
+
+    const [downstreamClientTransport, downstreamServerTransport] = InMemoryTransport.createLinkedPair();
+    await downstreamServer.connect(downstreamServerTransport);
+    const downstreamClient = createGuwahDownstreamClient();
+    await downstreamClient.connect(downstreamClientTransport);
+
+    const diagnosticWrites: string[] = [];
+    const originalStderrWrite = process.stderr.write.bind(process.stderr);
+    const stderrSpy = vi.spyOn(process.stderr, "write").mockImplementation(((
+      chunk: string | Uint8Array,
+      encodingOrCallback?: BufferEncoding | ((error?: Error | null) => void),
+      callback?: (error?: Error | null) => void,
+    ) => {
+      const text =
+        typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8");
+      diagnosticWrites.push(text);
+      if (typeof encodingOrCallback === "function") {
+        return originalStderrWrite(chunk, encodingOrCallback);
+      }
+      if (callback !== undefined) {
+        return originalStderrWrite(chunk, encodingOrCallback as BufferEncoding, callback);
+      }
+      if (encodingOrCallback !== undefined) {
+        return originalStderrWrite(chunk, encodingOrCallback as BufferEncoding);
+      }
+      return originalStderrWrite(chunk);
+    }) as typeof process.stderr.write);
+
+    const server = createGuwahGatewayServer({
+      policyPath,
+      mediatedTools: [mediatedTransfer],
+      activeRequests,
+      requestTimeoutMs: 50,
+      afterApproval: async (approved, context) => {
+        const args = approved.params.arguments;
+        const callOptions: {
+          client: typeof downstreamClient;
+          name: string;
+          signal: AbortSignal;
+          arguments?: Record<string, unknown>;
+        } = {
+          client: downstreamClient,
+          name: approved.params.name,
+          signal: context.signal,
+        };
+        if (
+          args !== undefined &&
+          typeof args === "object" &&
+          args !== null &&
+          !Array.isArray(args)
+        ) {
+          callOptions.arguments = args as Record<string, unknown>;
+        }
+        return await callGuwahDownstreamToolWithCancelPropagation(callOptions);
+      },
+    });
+
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await server.connect(serverTransport);
+    await clientTransport.start();
+
+    const responses: unknown[] = [];
+    clientTransport.onmessage = (message) => {
+      responses.push(message);
+    };
+
+    await initializeClient(clientTransport, responses, "guwah-delayed-response");
+
+    await clientTransport.send({
+      jsonrpc: "2.0",
+      id: 201,
+      method: "tools/call",
+      params: { name: TOOL_NAME, arguments: compliantArgs() },
+    });
+
+    const enteredDeadline = Date.now() + 5000;
+    while (Date.now() < enteredDeadline && downstreamToolCalls === 0) {
+      await new Promise((resolve) => {
+        setTimeout(resolve, 25);
+      });
+    }
+    expect(downstreamToolCalls).toBe(1);
+
+    // Deadline seals the call; registry end() clears flags, so wait until the id is inactive.
+    const finishedDeadline = Date.now() + 5000;
+    while (Date.now() < finishedDeadline && activeRequests.has(201)) {
+      await new Promise((resolve) => {
+        setTimeout(resolve, 25);
+      });
+    }
+    expect(activeRequests.has(201)).toBe(false);
+
+    releaseDownstream?.();
+    await new Promise((resolve) => {
+      setTimeout(resolve, 200);
+    });
+
+    expect(downstreamToolCalls).toBe(1);
+    const forId = responses.filter((message) => isJsonRpcForId(message, 201));
+    const successes = forId.filter(hasResult);
+    expect(successes).toHaveLength(0);
+    const responseText = JSON.stringify(responses);
+    expect(responseText).not.toContain(LATE_SECRET);
+    expect(responseText).not.toContain("approved:");
+    expect(diagnosticWrites.join("")).not.toContain(LATE_SECRET);
+
+    stderrSpy.mockRestore();
+    await server.close();
+    await clientTransport.close();
+    await downstreamClient.close();
+    await downstreamServer.close();
+  }, 15_000);
 });
 
 describe("gateway shutdown", () => {
@@ -10368,10 +11611,12 @@ describe("alternate-envelope bypass", () => {
     expect(source).toMatch(/Only tools\/call may execute tools/);
     expect(source).toMatch(/registerGatewayToolsCall\(server, callOptions\)/);
     expect(source).toMatch(/server\.setRequestHandler\(CallToolRequestSchema/);
-    const afterApprovalInvocations = source.match(/await options\.afterApproval\(approved\)/g) ?? [];
+    const afterApprovalInvocations =
+      source.match(/await options\.afterApproval\(approved,\s*\{\s*signal:\s*downstreamCancel\.signal,\s*\}\)/g) ??
+      [];
     expect(afterApprovalInvocations).toHaveLength(1);
     const callHandlerIndex = source.indexOf("server.setRequestHandler(CallToolRequestSchema");
-    const afterApprovalIndex = source.indexOf("await options.afterApproval(approved)");
+    const afterApprovalIndex = source.indexOf("await options.afterApproval(approved,");
     expect(callHandlerIndex).toBeGreaterThan(-1);
     expect(afterApprovalIndex).toBeGreaterThan(callHandlerIndex);
   });
@@ -10663,6 +11908,77 @@ describe("structured MCP errors", () => {
     const body = JSON.stringify(responses[1]);
     expect(body).not.toContain(SECRET_MARKER);
     expect(body).not.toContain(WHITELISTED_DESTINATION);
+
+    await server.close();
+    await clientTransport.close();
+  });
+
+  it("planted-secret downstream error is mapped to the generic downstream-failure code", async () => {
+    const policyPath = writePolicy();
+    const PLANTED = `sk_live_downstream_${SECRET_MARKER}_provider_dump`;
+
+    expect(isGuwahEmittedMcpError(mapGuwahDownstreamFailureToMcpError(new Error(PLANTED)))).toBe(
+      true,
+    );
+    const mapped = mapGuwahDownstreamFailureToMcpError(new Error(PLANTED));
+    expect(mapped.message).toContain(GUWAH_DOWNSTREAM_FAILURE_ERROR);
+    expect(mapped.message).not.toContain(PLANTED);
+    expect(mapped.data).toMatchObject({ guwahCode: GUWAH_DOWNSTREAM_FAILURE_CODE });
+
+    const server = createGuwahGatewayServer({
+      policyPath,
+      mediatedTools: [mediatedTransfer],
+      afterApproval: async (_approved, context) =>
+        callGuwahDownstreamToolWithCancelPropagation({
+          client: {
+            callTool: async () => {
+              throw new McpError(
+                ErrorCode.InternalError,
+                `Provider rejected transfer api_key=${PLANTED} destination=${WHITELISTED_DESTINATION}`,
+                { rawProviderBody: { secret: PLANTED } },
+              );
+            },
+          } as unknown as Pick<Client, "callTool">,
+          name: TOOL_NAME,
+          arguments: compliantArgs(),
+          signal: context.signal,
+          tool: mediatedTransfer,
+        }),
+    });
+    const { clientTransport, responses } = await initializePair(server);
+
+    await clientTransport.send({
+      jsonrpc: "2.0",
+      id: 9,
+      method: "tools/call",
+      params: {
+        name: TOOL_NAME,
+        arguments: compliantArgs(),
+      },
+    });
+    const deadline = Date.now() + 5000;
+    while (Date.now() < deadline && responses.length < 2) {
+      await new Promise((resolve) => {
+        setTimeout(resolve, 25);
+      });
+    }
+
+    expect(responses[1]).toMatchObject({
+      jsonrpc: "2.0",
+      id: 9,
+      error: {
+        code: -32603,
+        message: expect.stringContaining(GUWAH_DOWNSTREAM_FAILURE_ERROR),
+        data: { guwahCode: GUWAH_DOWNSTREAM_FAILURE_CODE },
+      },
+    });
+    expect(responses[1]).not.toHaveProperty("result");
+    const body = JSON.stringify(responses[1]);
+    expect(body).not.toContain(PLANTED);
+    expect(body).not.toContain(SECRET_MARKER);
+    expect(body).not.toContain(WHITELISTED_DESTINATION);
+    expect(body).not.toContain("rawProviderBody");
+    expect(body).not.toContain("api_key=");
 
     await server.close();
     await clientTransport.close();
