@@ -25,6 +25,13 @@ export const GUWAH_DOWNSTREAM_TRANSPORT_CONFIG_ERROR =
   "Downstream transport configuration is missing or invalid.";
 export const GUWAH_DOWNSTREAM_CONNECTION_ERROR = "Downstream MCP connection failed.";
 export const GUWAH_DOWNSTREAM_CONNECTION_DEAD_ERROR = "Downstream MCP connection is dead.";
+export const GUWAH_DOWNSTREAM_RECONNECTING_ERROR = "Downstream MCP reconnection is in progress.";
+export const GUWAH_DOWNSTREAM_RECONNECT_FAILED_ERROR =
+  "Downstream MCP reconnection failed before discovery and policy intersection.";
+export const GUWAH_DOWNSTREAM_OUTCOME_UNKNOWN_ERROR =
+  "Downstream call outcome is unknown after connection loss or reconnect.";
+export const GUWAH_DOWNSTREAM_UNAVAILABLE_CODE = "DOWNSTREAM_UNAVAILABLE";
+export const GUWAH_DOWNSTREAM_OUTCOME_UNKNOWN_CODE = "DOWNSTREAM_OUTCOME_UNKNOWN";
 export const GUWAH_TOOL_NAMESPACE_PREFIX = "guwah__";
 export const GUWAH_TOOL_NAMESPACE_ERROR = "Gateway tool name is ambiguous or invalid.";
 export const GUWAH_TOOL_COLLISION_ERROR = "Gateway tool name collision.";
@@ -138,6 +145,11 @@ export type GuwahGatewayServerOptions = {
    * Failures must throw; the list handler must not return a partial catalog.
    */
   readonly resolveMediatedTools?: () => readonly GuwahMediatedTool[];
+  /**
+   * Optional hook run before resolving the mediated catalog on tools/list and tools/call.
+   * Used to refresh discovery and remirror under policy when the downstream list mutates.
+   */
+  readonly beforeResolveMediatedTools?: () => void | Promise<void>;
   readonly policyPath?: string;
   readonly guard?: GuwahGuard;
   /**
@@ -296,6 +308,7 @@ export type GuwahStdioGatewayOptions = {
   readonly maxBufferSize?: number;
   readonly mediatedTools?: readonly GuwahMediatedTool[];
   readonly resolveMediatedTools?: () => readonly GuwahMediatedTool[];
+  readonly beforeResolveMediatedTools?: () => void | Promise<void>;
   readonly policyPath?: string;
   readonly guard?: GuwahGuard;
   readonly afterApproval?: (
@@ -387,9 +400,15 @@ function defaultAfterApproval(): CallToolResult {
 export function registerGatewayToolsList(
   server: Server,
   resolveMediatedTools: () => readonly GuwahMediatedTool[],
+  options?: {
+    readonly beforeResolveMediatedTools?: () => void | Promise<void>;
+  },
 ): void {
-  server.setRequestHandler(ListToolsRequestSchema, () => {
+  server.setRequestHandler(ListToolsRequestSchema, async () => {
     try {
+      if (options?.beforeResolveMediatedTools !== undefined) {
+        await options.beforeResolveMediatedTools();
+      }
       const mediated = resolveMediatedTools();
       return {
         tools: toProtocolTools(mediated),
@@ -417,6 +436,7 @@ export function registerGatewayToolsCall(
   server: Server,
   options: {
     readonly resolveMediatedTools: () => readonly GuwahMediatedTool[];
+    readonly beforeResolveMediatedTools?: () => void | Promise<void>;
     readonly guard: GuwahGuard;
     readonly afterApproval: (
       approved: Readonly<McpToolCallPayload>,
@@ -493,6 +513,10 @@ export function registerGatewayToolsCall(
     try {
       assertNotTerminal();
 
+      if (options.beforeResolveMediatedTools !== undefined) {
+        await options.beforeResolveMediatedTools();
+      }
+
       let mediated: readonly GuwahMediatedTool[];
       try {
         mediated = options.resolveMediatedTools();
@@ -535,7 +559,7 @@ export function registerGatewayToolsCall(
       assertNotTerminal();
       // Call path requires an explicit policy ENFORCE binding for the tool.
       options.guard.assertToolEnforced(policyToolName);
-      // Both channels are required; validateToolCall enforces payload-argument parity.
+      // Policy argsSchema remains enforcement after discovery remirror; catalog inputSchema is not trusted.
       const approved = options.guard.validateToolCall(envelope, candidateArgs);
       assertNotTerminal();
       // Forward only the frozen approved copy; never the original candidate object.
@@ -868,6 +892,255 @@ export async function connectGuwahDownstream(
   };
 }
 
+/**
+ * Seals active request ids when reconnect begins.
+ * Ambiguous in-flight work must not be reported as definitively unexecuted.
+ * Does not dispatch a second mutating call.
+ */
+export function sealGuwahRequestsForFailClosedReconnect(
+  activeRequests: GuwahActiveRequestRegistry,
+): void {
+  activeRequests.abortAllActive();
+}
+
+/**
+ * Tracks an explicit reconnect window. While open, calls must fail closed.
+ * Automatic failover is not performed; operators drive reconnect.
+ */
+export type GuwahDownstreamReconnectGate = {
+  readonly isReconnecting: () => boolean;
+  readonly assertNotReconnecting: () => void;
+  readonly run: <T>(work: () => Promise<T>) => Promise<T>;
+};
+
+export function createGuwahDownstreamReconnectGate(): GuwahDownstreamReconnectGate {
+  let reconnecting = false;
+  return {
+    isReconnecting: () => reconnecting,
+    assertNotReconnecting: () => {
+      if (reconnecting) {
+        throw new Error(GUWAH_DOWNSTREAM_RECONNECTING_ERROR);
+      }
+    },
+    run: async <T>(work: () => Promise<T>): Promise<T> => {
+      if (reconnecting) {
+        throw new Error(GUWAH_DOWNSTREAM_RECONNECTING_ERROR);
+      }
+      reconnecting = true;
+      try {
+        return await work();
+      } finally {
+        reconnecting = false;
+      }
+    },
+  };
+}
+
+export type GuwahDownstreamReconnectResult = {
+  readonly connection: GuwahDownstreamConnection;
+  readonly discovered: readonly GuwahMediatedTool[];
+  readonly mirrored: readonly GuwahMediatedTool[];
+};
+
+/**
+ * Explicit fail-closed downstream reconnect.
+ * Does not restore tools until connect, discovery, and policy intersection succeed.
+ * Callers must clear the host catalog before invoking and assign `mirrored` only on success.
+ * Does not retry in-flight mutating calls; seal active request ids separately first.
+ * Automatic provider failover is not performed.
+ */
+export async function reconnectGuwahDownstreamFailClosed(options: {
+  readonly config: GuwahDownstreamTransportConfig;
+  readonly guard: GuwahGuard;
+  readonly previousConnection?: GuwahDownstreamConnection;
+}): Promise<GuwahDownstreamReconnectResult> {
+  if (options.previousConnection !== undefined) {
+    try {
+      await options.previousConnection.client.close();
+    } catch {
+      // Best-effort close of the prior dead or stale connection.
+    }
+    try {
+      await options.previousConnection.transport.close();
+    } catch {
+      // Best-effort close of the prior dead or stale connection.
+    }
+  }
+
+  let connection: GuwahDownstreamConnection;
+  try {
+    connection = await connectGuwahDownstream(options.config);
+  } catch {
+    throw new Error(GUWAH_DOWNSTREAM_RECONNECT_FAILED_ERROR);
+  }
+
+  let discovered: readonly GuwahMediatedTool[];
+  try {
+    discovered = await discoverGuwahDownstreamTools(connection);
+  } catch {
+    try {
+      await connection.client.close();
+    } catch {
+      // Best-effort cleanup after incomplete reconnect.
+    }
+    throw new Error(GUWAH_DOWNSTREAM_RECONNECT_FAILED_ERROR);
+  }
+
+  let mirrored: readonly GuwahMediatedTool[];
+  try {
+    // Tools restore only after discovery ∩ policy remirror succeeds.
+    mirrored = remirrorGuwahToolsFromDiscovery(discovered, options.guard);
+  } catch {
+    try {
+      await connection.client.close();
+    } catch {
+      // Best-effort cleanup after incomplete reconnect.
+    }
+    throw new Error(GUWAH_DOWNSTREAM_RECONNECT_FAILED_ERROR);
+  }
+
+  return Object.freeze({
+    connection,
+    discovered,
+    mirrored,
+  });
+}
+
+/**
+ * Classifies whether a downstream dispatch may proceed or must fail closed.
+ * Pre-dispatch unavailability is blocked locally.
+ * Post-dispatch unavailability is outcome-unknown — never speculative success.
+ * Does not claim provider-side rollback.
+ */
+export type GuwahDownstreamDispatchClassification =
+  | "available"
+  | "blocked-locally"
+  | "outcome-unknown";
+
+export function classifyGuwahDownstreamDispatchState(options: {
+  readonly isHealthy: () => boolean;
+  readonly isReconnecting?: () => boolean;
+  readonly dispatchStarted: boolean;
+}): GuwahDownstreamDispatchClassification {
+  const reconnecting = options.isReconnecting?.() === true;
+  const healthy = options.isHealthy();
+  if (!options.dispatchStarted) {
+    if (reconnecting || !healthy) {
+      return "blocked-locally";
+    }
+    return "available";
+  }
+  if (reconnecting || !healthy) {
+    return "outcome-unknown";
+  }
+  return "available";
+}
+
+export function mapGuwahDownstreamDispatchStateToMcpError(
+  classification: Exclude<GuwahDownstreamDispatchClassification, "available">,
+  options?: {
+    readonly reconnecting?: boolean;
+  },
+): McpError {
+  if (classification === "blocked-locally") {
+    const message =
+      options?.reconnecting === true
+        ? GUWAH_DOWNSTREAM_RECONNECTING_ERROR
+        : GUWAH_DOWNSTREAM_CONNECTION_DEAD_ERROR;
+    return new McpError(ErrorCode.InternalError, message, {
+      guwahCode: GUWAH_DOWNSTREAM_UNAVAILABLE_CODE,
+    });
+  }
+  return new McpError(ErrorCode.InternalError, GUWAH_DOWNSTREAM_OUTCOME_UNKNOWN_ERROR, {
+    guwahCode: GUWAH_DOWNSTREAM_OUTCOME_UNKNOWN_CODE,
+  });
+}
+
+/**
+ * Wraps afterApproval so unknown downstream state cannot produce speculative success.
+ * Distinguishes blocked-locally (pre-dispatch) from outcome-unknown (post-dispatch).
+ */
+export function wrapGuwahAfterApprovalForDownstreamAmbiguity(options: {
+  readonly afterApproval: (
+    approved: Readonly<McpToolCallPayload>,
+  ) => CallToolResult | Promise<CallToolResult>;
+  readonly isHealthy: () => boolean;
+  readonly isReconnecting?: () => boolean;
+}): (
+  approved: Readonly<McpToolCallPayload>,
+) => CallToolResult | Promise<CallToolResult> {
+  return async (approved) => {
+    const reconnecting = options.isReconnecting?.() === true;
+    const beforeState: {
+      isHealthy: () => boolean;
+      isReconnecting?: () => boolean;
+      dispatchStarted: boolean;
+    } = {
+      isHealthy: options.isHealthy,
+      dispatchStarted: false,
+    };
+    if (options.isReconnecting !== undefined) {
+      beforeState.isReconnecting = options.isReconnecting;
+    }
+    const before = classifyGuwahDownstreamDispatchState(beforeState);
+    if (before === "blocked-locally") {
+      throw mapGuwahDownstreamDispatchStateToMcpError("blocked-locally", { reconnecting });
+    }
+
+    let dispatchStarted = false;
+    try {
+      dispatchStarted = true;
+      const dispatchApproved = options.afterApproval;
+      const result = await dispatchApproved(approved);
+      const afterState: {
+        isHealthy: () => boolean;
+        isReconnecting?: () => boolean;
+        dispatchStarted: boolean;
+      } = {
+        isHealthy: options.isHealthy,
+        dispatchStarted: true,
+      };
+      if (options.isReconnecting !== undefined) {
+        afterState.isReconnecting = options.isReconnecting;
+      }
+      const after = classifyGuwahDownstreamDispatchState(afterState);
+      if (after !== "available") {
+        // Disconnect or reconnect during/after dispatch: never speculative success.
+        throw mapGuwahDownstreamDispatchStateToMcpError("outcome-unknown");
+      }
+      return result;
+    } catch (error: unknown) {
+      if (error instanceof McpError) {
+        const data = error.data as { guwahCode?: unknown } | undefined;
+        if (
+          data?.guwahCode === GUWAH_DOWNSTREAM_OUTCOME_UNKNOWN_CODE ||
+          data?.guwahCode === GUWAH_DOWNSTREAM_UNAVAILABLE_CODE
+        ) {
+          throw error;
+        }
+      }
+      if (dispatchStarted) {
+        const afterState: {
+          isHealthy: () => boolean;
+          isReconnecting?: () => boolean;
+          dispatchStarted: boolean;
+        } = {
+          isHealthy: options.isHealthy,
+          dispatchStarted: true,
+        };
+        if (options.isReconnecting !== undefined) {
+          afterState.isReconnecting = options.isReconnecting;
+        }
+        const after = classifyGuwahDownstreamDispatchState(afterState);
+        if (after === "outcome-unknown") {
+          throw mapGuwahDownstreamDispatchStateToMcpError("outcome-unknown");
+        }
+      }
+      throw error;
+    }
+  };
+}
+
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
@@ -944,6 +1217,129 @@ export async function discoverGuwahDownstreamTools(
 }
 
 /**
+ * Deterministic identity of a discovered tool for list-change detection.
+ * Uses already-admitted mediated tool graphs only (not hostile runtime input).
+ */
+function fingerprintDiscoveredTool(tool: GuwahMediatedTool): string {
+  return JSON.stringify({
+    name: tool.name,
+    description: tool.description ?? null,
+    inputSchema: tool.inputSchema,
+  });
+}
+
+/**
+ * Stable fingerprint of a full discovery list.
+ * Order-independent: tools are sorted by name before hashing.
+ */
+export function fingerprintGuwahDiscoveryList(
+  tools: readonly GuwahMediatedTool[],
+): string {
+  const fingerprints = tools
+    .map((tool) => ({ name: tool.name, fingerprint: fingerprintDiscoveredTool(tool) }))
+    .sort((left, right) => {
+      if (left.name < right.name) {
+        return -1;
+      }
+      if (left.name > right.name) {
+        return 1;
+      }
+      return 0;
+    })
+    .map((entry) => entry.fingerprint);
+  return fingerprints.join("\n");
+}
+
+/**
+ * Result of comparing two downstream discovery snapshots.
+ * Detects list churn only; does not remirror under policy or update the gateway catalog.
+ */
+export type GuwahDiscoveryListChange = {
+  readonly previous: readonly GuwahMediatedTool[];
+  readonly current: readonly GuwahMediatedTool[];
+  readonly changed: boolean;
+  readonly addedNames: readonly string[];
+  readonly removedNames: readonly string[];
+  readonly changedSchemaNames: readonly string[];
+  readonly previousFingerprint: string;
+  readonly currentFingerprint: string;
+};
+
+/**
+ * Compares two discovery snapshots for additions, removals, and retained-name schema drift.
+ * Policy intersection and gateway catalog updates are out of scope.
+ */
+export function detectGuwahDiscoveryListChange(
+  previous: readonly GuwahMediatedTool[],
+  current: readonly GuwahMediatedTool[],
+): GuwahDiscoveryListChange {
+  const previousByName = new Map<string, GuwahMediatedTool>();
+  for (const tool of previous) {
+    previousByName.set(tool.name, tool);
+  }
+  const currentByName = new Map<string, GuwahMediatedTool>();
+  for (const tool of current) {
+    currentByName.set(tool.name, tool);
+  }
+
+  const addedNames: string[] = [];
+  for (const name of currentByName.keys()) {
+    if (!previousByName.has(name)) {
+      addedNames.push(name);
+    }
+  }
+  addedNames.sort();
+
+  const removedNames: string[] = [];
+  for (const name of previousByName.keys()) {
+    if (!currentByName.has(name)) {
+      removedNames.push(name);
+    }
+  }
+  removedNames.sort();
+
+  const changedSchemaNames: string[] = [];
+  for (const [name, currentTool] of currentByName) {
+    const previousTool = previousByName.get(name);
+    if (
+      previousTool !== undefined &&
+      fingerprintDiscoveredTool(previousTool) !== fingerprintDiscoveredTool(currentTool)
+    ) {
+      changedSchemaNames.push(name);
+    }
+  }
+  changedSchemaNames.sort();
+
+  const previousFingerprint = fingerprintGuwahDiscoveryList(previous);
+  const currentFingerprint = fingerprintGuwahDiscoveryList(current);
+
+  return Object.freeze({
+    previous: Object.freeze([...previous]),
+    current: Object.freeze([...current]),
+    changed: previousFingerprint !== currentFingerprint,
+    addedNames: Object.freeze(addedNames),
+    removedNames: Object.freeze(removedNames),
+    changedSchemaNames: Object.freeze(changedSchemaNames),
+    previousFingerprint,
+    currentFingerprint,
+  });
+}
+
+/**
+ * Re-runs downstream tools/list and compares it to a previous discovery snapshot.
+ * Establishes deterministic refresh detection for list churn.
+ * Does not remirror authorized tools or widen the gateway allowlist.
+ */
+export async function pollGuwahDownstreamDiscovery(
+  connection: Pick<GuwahDownstreamConnection, "client" | "isHealthy" | "assertHealthy">,
+  previous: readonly GuwahMediatedTool[],
+): Promise<GuwahDiscoveryListChange> {
+  // Detection only: does not remirror authorized tools or update the gateway catalog.
+  const current = await discoverGuwahDownstreamTools(connection);
+  return detectGuwahDiscoveryListChange(previous, current);
+}
+
+/**
  * Intersects discovered downstream tools with local policy ENFORCE names.
  * Tools absent from policy are omitted from the gateway catalog (not advertised).
  * Does not auto-authorize newly discovered tools.
@@ -970,6 +1366,42 @@ export function mirrorAuthorizedGuwahTools(
     mirrored.push(tool);
   }
   return Object.freeze(mirrored);
+}
+
+/**
+ * Recomputes the host-facing mirrored catalog from a discovery snapshot under policy.
+ * Downstream inputSchema is catalog metadata only and is never treated as policy authority.
+ */
+export function remirrorGuwahToolsFromDiscovery(
+  discovered: readonly GuwahMediatedTool[],
+  guard: GuwahGuard,
+): readonly GuwahMediatedTool[] {
+  return applyGuwahToolNamespacing(mirrorAuthorizedGuwahTools(discovered, guard));
+}
+
+/**
+ * Polls downstream tools/list and recomputes the mirrored set under local policy.
+ * Removed tools disappear from the mirrored catalog.
+ * Added tools remain omitted until human policy ENFORCE includes them.
+ * Retained-name schema drift does not widen acceptance; policy argsSchema remains enforcement.
+ */
+export async function refreshGuwahMirroredToolsFromDiscovery(
+  connection: Pick<GuwahDownstreamConnection, "client" | "isHealthy" | "assertHealthy">,
+  previousDiscovery: readonly GuwahMediatedTool[],
+  guard: GuwahGuard,
+): Promise<{
+  readonly change: GuwahDiscoveryListChange;
+  readonly discovered: readonly GuwahMediatedTool[];
+  readonly mirrored: readonly GuwahMediatedTool[];
+}> {
+  const change = await pollGuwahDownstreamDiscovery(connection, previousDiscovery);
+  const discovered = change.current;
+  const mirrored = remirrorGuwahToolsFromDiscovery(discovered, guard);
+  return Object.freeze({
+    change,
+    discovered,
+    mirrored,
+  });
 }
 
 /**
@@ -1115,6 +1547,7 @@ export function createGuwahGatewayServer(options?: GuwahGatewayServerOptions): S
   };
   const callOptions: {
     resolveMediatedTools: () => readonly GuwahMediatedTool[];
+    beforeResolveMediatedTools?: () => void | Promise<void>;
     guard: GuwahGuard;
     afterApproval: (
       approved: Readonly<McpToolCallPayload>,
@@ -1131,6 +1564,9 @@ export function createGuwahGatewayServer(options?: GuwahGatewayServerOptions): S
     activeRequests,
     isHandshakeComplete,
   };
+  if (options?.beforeResolveMediatedTools !== undefined) {
+    callOptions.beforeResolveMediatedTools = options.beforeResolveMediatedTools;
+  }
   if (requestTimeoutMs !== undefined) {
     callOptions.requestTimeoutMs = requestTimeoutMs;
   }
@@ -1140,7 +1576,11 @@ export function createGuwahGatewayServer(options?: GuwahGatewayServerOptions): S
   if (options?.onActiveCountChange !== undefined) {
     callOptions.onActiveCountChange = options.onActiveCountChange;
   }
-  registerGatewayToolsList(server, resolveMediatedTools);
+  const listOptions =
+    options?.beforeResolveMediatedTools === undefined
+      ? undefined
+      : { beforeResolveMediatedTools: options.beforeResolveMediatedTools };
+  registerGatewayToolsList(server, resolveMediatedTools, listOptions);
   registerGatewayToolsCall(server, callOptions);
   return server;
 }
@@ -1283,6 +1723,7 @@ function buildServerOptionsFromStdio(
   const serverOptions: {
     mediatedTools?: readonly GuwahMediatedTool[];
     resolveMediatedTools?: () => readonly GuwahMediatedTool[];
+    beforeResolveMediatedTools?: () => void | Promise<void>;
     policyPath?: string;
     guard?: GuwahGuard;
     afterApproval?: (
@@ -1297,6 +1738,9 @@ function buildServerOptionsFromStdio(
   }
   if (options.resolveMediatedTools !== undefined) {
     serverOptions.resolveMediatedTools = options.resolveMediatedTools;
+  }
+  if (options.beforeResolveMediatedTools !== undefined) {
+    serverOptions.beforeResolveMediatedTools = options.beforeResolveMediatedTools;
   }
   if (options.policyPath !== undefined) {
     serverOptions.policyPath = options.policyPath;
@@ -1350,21 +1794,39 @@ export async function startGuwahStdioGateway(
 }> {
   // Missing path => deny-all (no implicit localhost). Provided path must validate and connect.
   let downstreamConnection: GuwahDownstreamConnection | undefined;
+  let lastDiscoveredTools: readonly GuwahMediatedTool[] | undefined;
   let mirroredMediatedTools: readonly GuwahMediatedTool[] | undefined;
+  let discoveryGuard: GuwahGuard | undefined;
   if (options?.downstreamTransportConfigPath !== undefined) {
     const downstreamConfig = loadGuwahDownstreamTransportConfig(
       options.downstreamTransportConfigPath,
     );
     // Failed connect must not proceed to a tool-exposing gateway server.
     downstreamConnection = await connectGuwahDownstream(downstreamConfig);
-    const guard = resolveGuard(options);
+    discoveryGuard = resolveGuard(options);
     const discovered = await discoverGuwahDownstreamTools(downstreamConnection);
+    lastDiscoveredTools = discovered;
     // Gateway tools/list is policy ∩ discovery; extras are omitted, never auto-authorized.
     // Host-facing names are deterministically namespaced away from raw downstream names.
-    mirroredMediatedTools = applyGuwahToolNamespacing(
-      mirrorAuthorizedGuwahTools(discovered, guard),
-    );
+    mirroredMediatedTools = remirrorGuwahToolsFromDiscovery(discovered, discoveryGuard);
   }
+
+  const refreshMirroredCatalogFromDiscovery = async (): Promise<void> => {
+    if (
+      downstreamConnection === undefined ||
+      discoveryGuard === undefined ||
+      lastDiscoveredTools === undefined
+    ) {
+      return;
+    }
+    const refreshed = await refreshGuwahMirroredToolsFromDiscovery(
+      downstreamConnection,
+      lastDiscoveredTools,
+      discoveryGuard,
+    );
+    lastDiscoveredTools = refreshed.discovered;
+    mirroredMediatedTools = refreshed.mirrored;
+  };
 
   const stdinStream = options?.stdin ?? process.stdin;
   const stdoutStream = options?.stdout ?? process.stdout;
@@ -1432,21 +1894,25 @@ export async function startGuwahStdioGateway(
   };
 
   const userAfterApproval = options?.afterApproval ?? defaultAfterApproval;
+  const guardedAfterApproval =
+    downstreamConnection === undefined
+      ? userAfterApproval
+      : wrapGuwahAfterApprovalForDownstreamAmbiguity({
+          afterApproval: userAfterApproval,
+          isHealthy: () => downstreamConnection?.isHealthy() === true,
+        });
   const serverOptions = buildServerOptionsFromStdio({
     ...options,
-    ...(mirroredMediatedTools !== undefined ? { mediatedTools: mirroredMediatedTools } : {}),
+    ...(mirroredMediatedTools !== undefined
+      ? {
+          resolveMediatedTools: () => mirroredMediatedTools ?? Object.freeze([]),
+          beforeResolveMediatedTools: refreshMirroredCatalogFromDiscovery,
+        }
+      : {}),
     activeRequests,
     afterApproval: async (approved) => {
       if (!acceptingNewMessages) {
         throw new McpError(ErrorCode.InternalError, "Gateway is shutting down.");
-      }
-      if (downstreamConnection !== undefined) {
-        // Dead/stale downstream must fail closed for subsequent calls; no failover.
-        try {
-          downstreamConnection.assertHealthy();
-        } catch {
-          throw new McpError(ErrorCode.InternalError, GUWAH_DOWNSTREAM_CONNECTION_DEAD_ERROR);
-        }
       }
       activeDispatches += 1;
       try {
@@ -1454,14 +1920,8 @@ export async function startGuwahStdioGateway(
         if (!acceptingNewMessages) {
           throw new McpError(ErrorCode.InternalError, "Gateway is shutting down.");
         }
-        if (downstreamConnection !== undefined) {
-          try {
-            downstreamConnection.assertHealthy();
-          } catch {
-            throw new McpError(ErrorCode.InternalError, GUWAH_DOWNSTREAM_CONNECTION_DEAD_ERROR);
-          }
-        }
-        return await userAfterApproval(approved);
+        // Pre-dispatch unavailability is blocked locally; mid-dispatch death is outcome-unknown.
+        return await guardedAfterApproval(approved);
       } finally {
         activeDispatches = Math.max(0, activeDispatches - 1);
         notifyIdle();
