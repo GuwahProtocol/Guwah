@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
@@ -75,6 +75,8 @@ import {
 import {
   GuwahGuard,
   GuwahSecurityViolation,
+  resolveGuwahActivePolicyPath,
+  resolveGuwahPackagedSamplePolicyPath,
   type GuwahViolationCode,
   type McpToolCallPayload,
 } from "../src/guwahGuard.js";
@@ -658,8 +660,15 @@ describe("downstream connection health", () => {
 describe("fail-closed reconnection", () => {
   const policyDirs: string[] = [];
   const liveDownstream: Array<{ client: Client; transport: StdioClientTransport }> = [];
+  const liveFixtures: GuwahFakeDownstreamServer[] = [];
 
   afterEach(async () => {
+    while (liveFixtures.length > 0) {
+      const fixture = liveFixtures.pop();
+      if (fixture !== undefined) {
+        await fixture.stop();
+      }
+    }
     for (const entry of liveDownstream.splice(0, liveDownstream.length)) {
       try {
         await entry.client.close();
@@ -975,6 +984,133 @@ describe("fail-closed reconnection", () => {
 
     await host.close().catch(() => undefined);
     await gateway.close().catch(() => undefined);
+  });
+
+  it("reconnect fixtures keep calls fail-closed until discovery and policy intersection succeed", async () => {
+    const { policyPath, guard } = writePolicy({
+      fake_transfer: {
+        action: "ENFORCE",
+        argsSchema: {
+          $schema: "http://json-schema.org/draft-07/schema#",
+          type: "object",
+          additionalProperties: false,
+          required: ["amountMinor"],
+          properties: {
+            amountMinor: { type: "integer", minimum: 1, maximum: 5000 },
+          },
+        },
+      },
+    });
+
+    const { fixture, connection } = await startGuwahFakeDownstream({
+      tools: [
+        {
+          name: "fake_transfer",
+          inputSchema: { type: "object", properties: { amountMinor: { type: "integer" } } },
+        },
+        {
+          name: "unvalidated_extra",
+          inputSchema: { type: "object", properties: {} },
+        },
+      ],
+    });
+    liveFixtures.push(fixture);
+
+    const gate = createGuwahDownstreamReconnectGate();
+    let mirrored: readonly GuwahMediatedTool[] = remirrorGuwahToolsFromDiscovery(
+      [
+        {
+          name: "fake_transfer",
+          inputSchema: { type: "object", properties: { amountMinor: { type: "integer" } } },
+        },
+      ],
+      guard,
+    );
+
+    const gateway = createGuwahGatewayServer({
+      policyPath,
+      resolveMediatedTools: () => mirrored,
+      beforeResolveMediatedTools: () => {
+        gate.assertNotReconnecting();
+      },
+      afterApproval: async (approved, context) => {
+        const args = approved.params.arguments;
+        const callOptions: {
+          client: typeof connection.client;
+          name: string;
+          signal: AbortSignal;
+          arguments?: Record<string, unknown>;
+        } = {
+          client: connection.client,
+          name: approved.params.name,
+          signal: context.signal,
+        };
+        if (
+          args !== undefined &&
+          typeof args === "object" &&
+          args !== null &&
+          !Array.isArray(args)
+        ) {
+          callOptions.arguments = args as Record<string, unknown>;
+        }
+        return await callGuwahDownstreamToolWithCancelPropagation(callOptions);
+      },
+    });
+    const [hostTransport, gatewayTransport] = InMemoryTransport.createLinkedPair();
+    const host = new Client({ name: "guwah-reconnect-fixture", version: "0.0.0" });
+    await gateway.connect(gatewayTransport);
+    await host.connect(hostTransport);
+
+    // During reconnect: catalog cleared; host calls fail closed; no unsafe send.
+    const reconnectWork = gate.run(async () => {
+      mirrored = Object.freeze([]);
+      await new Promise((resolve) => {
+        setTimeout(resolve, 40);
+      });
+      const discovered = await discoverGuwahDownstreamTools(connection);
+      mirrored = remirrorGuwahToolsFromDiscovery(discovered, guard);
+      return mirrored;
+    });
+
+    await expect(
+      host.callTool({
+        name: "guwah__fake_transfer",
+        arguments: { amountMinor: 100 },
+      }),
+    ).rejects.toThrow();
+    await expect(
+      host.callTool({
+        name: "guwah__unvalidated_extra",
+        arguments: {},
+      }),
+    ).rejects.toThrow();
+    expect(fixture.getInvocationCount()).toBe(0);
+
+    const restored = await reconnectWork;
+    expect(restored.map((tool) => tool.name)).toEqual(["guwah__fake_transfer"]);
+    expect(restored.some((tool) => tool.name.includes("unvalidated_extra"))).toBe(false);
+
+    // After intersection succeeds: authorized tool may dispatch once; unvalidated stays denied.
+    await host.callTool({
+      name: "guwah__fake_transfer",
+      arguments: { amountMinor: 100 },
+    });
+    expect(fixture.getInvocationCount()).toBe(1);
+    expect(fixture.getInvocations()[0]).toMatchObject({
+      name: "fake_transfer",
+      arguments: { amountMinor: 100 },
+    });
+
+    await expect(
+      host.callTool({
+        name: "guwah__unvalidated_extra",
+        arguments: {},
+      }),
+    ).rejects.toThrow();
+    expect(fixture.getInvocationCount()).toBe(1);
+
+    await host.close();
+    await gateway.close();
   });
 });
 
@@ -2553,6 +2689,17 @@ describe("tool-name collisions", () => {
     properties: {},
   };
 
+  const liveFixtures: GuwahFakeDownstreamServer[] = [];
+
+  afterEach(async () => {
+    while (liveFixtures.length > 0) {
+      const fixture = liveFixtures.pop();
+      if (fixture !== undefined) {
+        await fixture.stop();
+      }
+    }
+  });
+
   it("rejects namespacing when two tools would share a gateway name", () => {
     expect(() =>
       applyGuwahToolNamespacing([
@@ -2622,6 +2769,70 @@ describe("tool-name collisions", () => {
 
     await client.close();
     await emptyServer.close();
+  });
+
+  it("collision fixtures produce zero unsafe downstream dispatch", async () => {
+    const { fixture, connection } = await startGuwahFakeDownstream({
+      tools: [
+        { name: "alpha", inputSchema: schema },
+        { name: "beta", inputSchema: schema },
+      ],
+    });
+    liveFixtures.push(fixture);
+
+    const colliding: GuwahMediatedTool[] = [
+      {
+        name: "guwah__shared",
+        downstreamName: "alpha",
+        inputSchema: schema,
+      },
+      {
+        name: "guwah__shared",
+        downstreamName: "beta",
+        inputSchema: schema,
+      },
+    ];
+
+    expect(() =>
+      createGuwahGatewayServer({
+        mediatedTools: colliding,
+        afterApproval: async (approved, context) => {
+          const args = approved.params.arguments;
+          const callOptions: {
+            client: typeof connection.client;
+            name: string;
+            signal: AbortSignal;
+            arguments?: Record<string, unknown>;
+          } = {
+            client: connection.client,
+            name: approved.params.name,
+            signal: context.signal,
+          };
+          if (
+            args !== undefined &&
+            typeof args === "object" &&
+            args !== null &&
+            !Array.isArray(args)
+          ) {
+            callOptions.arguments = args as Record<string, unknown>;
+          }
+          return await callGuwahDownstreamToolWithCancelPropagation(callOptions);
+        },
+      }),
+    ).toThrow(GUWAH_TOOL_COLLISION_ERROR);
+
+    // No gateway was created; fake downstream must not have been invoked.
+    expect(fixture.getInvocationCount()).toBe(0);
+    expect(fixture.getInvocations()).toEqual([]);
+
+    // Namespacing collision from raw downstream names also fails closed with no merge.
+    expect(() =>
+      applyGuwahToolNamespacing([
+        { name: "shared", inputSchema: { type: "object", properties: { a: { type: "integer" } } } },
+        { name: "shared", inputSchema: { type: "object", properties: { b: { type: "string" } } } },
+      ]),
+    ).toThrow(GUWAH_TOOL_COLLISION_ERROR);
+    expect(fixture.getInvocationCount()).toBe(0);
   });
 
   it("does not silently repair collisions with automatic suffixes", () => {
@@ -3707,10 +3918,17 @@ describe("approved forwarding", () => {
 
 describe("blocked-forwarding invocation proof", () => {
   const policyDirs: string[] = [];
+  const liveFixtures: GuwahFakeDownstreamServer[] = [];
   const TOOL_NAME = "coinbase_cdp_transfer";
   const WHITELISTED_DESTINATION = "0x1111111111111111111111111111111111111111";
 
-  afterEach(() => {
+  afterEach(async () => {
+    while (liveFixtures.length > 0) {
+      const fixture = liveFixtures.pop();
+      if (fixture !== undefined) {
+        await fixture.stop();
+      }
+    }
     for (const dir of policyDirs.splice(0, policyDirs.length)) {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -3786,20 +4004,47 @@ describe("blocked-forwarding invocation proof", () => {
     readonly callParams: { readonly name: string; readonly arguments: Record<string, unknown> };
     readonly expectedGuwahCode: string;
   }): Promise<void> {
-    let downstreamInvocations = 0;
-    let downstreamConnectAttempts = 0;
     const policyPath = options.policyPath ?? writePolicy();
     const guard = options.guard ?? new GuwahGuard({ policyPath });
     options.prepareGuard?.(guard);
 
+    const { fixture, connection } = await startGuwahFakeDownstream({
+      tools: [
+        {
+          name: TOOL_NAME,
+          inputSchema: mediatedTransfer.inputSchema,
+        },
+      ],
+    });
+    liveFixtures.push(fixture);
+
     const server = createGuwahGatewayServer({
       guard,
       mediatedTools: options.mediatedTools ?? [mediatedTransfer],
-      afterApproval: async () => {
-        // Fake downstream connect/send: must never run after validation failure.
-        downstreamConnectAttempts += 1;
-        downstreamInvocations += 1;
-        return { content: [{ type: "text", text: "should-not-run" }] };
+      afterApproval: async (approved, context) => {
+        // Real fake-downstream send: must never run after validation failure.
+        const args = approved.params.arguments;
+        const callOptions: {
+          client: typeof connection.client;
+          name: string;
+          signal: AbortSignal;
+          arguments?: Record<string, unknown>;
+          tool: GuwahMediatedTool;
+        } = {
+          client: connection.client,
+          name: approved.params.name,
+          signal: context.signal,
+          tool: mediatedTransfer,
+        };
+        if (
+          args !== undefined &&
+          typeof args === "object" &&
+          args !== null &&
+          !Array.isArray(args)
+        ) {
+          callOptions.arguments = args as Record<string, unknown>;
+        }
+        return await callGuwahDownstreamToolWithCancelPropagation(callOptions);
       },
     });
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
@@ -3829,6 +4074,7 @@ describe("blocked-forwarding invocation proof", () => {
       jsonrpc: "2.0",
       method: "notifications/initialized",
     });
+    expect(fixture.getInvocationCount()).toBe(0);
     await clientTransport.send({
       jsonrpc: "2.0",
       id: 2,
@@ -3842,8 +4088,9 @@ describe("blocked-forwarding invocation proof", () => {
       });
     }
 
-    expect(downstreamConnectAttempts).toBe(0);
-    expect(downstreamInvocations).toBe(0);
+    // Invocation-proof: blocked calls must not send to the fake downstream.
+    expect(fixture.getInvocationCount()).toBe(0);
+    expect(fixture.getInvocations()).toEqual([]);
     expect(responses[1]).toMatchObject({
       jsonrpc: "2.0",
       id: 2,
@@ -4019,6 +4266,175 @@ describe("prevent direct downstream bypass", () => {
   });
 });
 
+describe("direct-bypass prevention", () => {
+  const policyDirs: string[] = [];
+  const liveFixtures: GuwahFakeDownstreamServer[] = [];
+  const RAW_DOWNSTREAM_NAME = "coinbase_cdp_transfer";
+  const UNMIRRORED_NAME = "unmirrored_provider_tool";
+
+  const transferArgsSchema = {
+    $schema: "http://json-schema.org/draft-07/schema#",
+    type: "object",
+    additionalProperties: false,
+    required: ["amountMinor"],
+    properties: {
+      amountMinor: { type: "integer", minimum: 1, maximum: 5000 },
+    },
+  } as const;
+
+  afterEach(async () => {
+    while (liveFixtures.length > 0) {
+      const fixture = liveFixtures.pop();
+      if (fixture !== undefined) {
+        await fixture.stop();
+      }
+    }
+    for (const dir of policyDirs.splice(0, policyDirs.length)) {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  function writePolicy(tools: Record<string, unknown>): { policyPath: string; guard: GuwahGuard } {
+    const dir = mkdtempSync(path.join(tmpdir(), "guwah-bypass-proof-"));
+    policyDirs.push(dir);
+    const policyPath = path.join(dir, "guwah-policy.json");
+    writeFileSync(
+      policyPath,
+      `${JSON.stringify(
+        {
+          version: "1.0.0",
+          posture: "default-deny",
+          tools,
+        },
+        null,
+        2,
+      )}\n`,
+      "utf8",
+    );
+    return { policyPath, guard: new GuwahGuard({ policyPath }) };
+  }
+
+  async function expectZeroDownstreamDispatch(options: {
+    readonly policyPath: string;
+    readonly mediatedTools: readonly GuwahMediatedTool[];
+    readonly callName: string;
+    readonly callArguments: Record<string, unknown>;
+  }): Promise<void> {
+    const { fixture, connection } = await startGuwahFakeDownstream({
+      tools: [
+        {
+          name: RAW_DOWNSTREAM_NAME,
+          inputSchema: { type: "object", properties: { amountMinor: { type: "integer" } } },
+        },
+        {
+          name: UNMIRRORED_NAME,
+          inputSchema: { type: "object", properties: { amountMinor: { type: "integer" } } },
+        },
+      ],
+    });
+    liveFixtures.push(fixture);
+
+    const server = createGuwahGatewayServer({
+      policyPath: options.policyPath,
+      mediatedTools: options.mediatedTools,
+      afterApproval: async (approved, context) => {
+        const args = approved.params.arguments;
+        const callOptions: {
+          client: typeof connection.client;
+          name: string;
+          signal: AbortSignal;
+          arguments?: Record<string, unknown>;
+        } = {
+          client: connection.client,
+          name: approved.params.name,
+          signal: context.signal,
+        };
+        if (
+          args !== undefined &&
+          typeof args === "object" &&
+          args !== null &&
+          !Array.isArray(args)
+        ) {
+          callOptions.arguments = args as Record<string, unknown>;
+        }
+        return await callGuwahDownstreamToolWithCancelPropagation(callOptions);
+      },
+    });
+
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    const client = new Client({ name: "guwah-bypass-fixture", version: "0.0.0" });
+    await server.connect(serverTransport);
+    await client.connect(clientTransport);
+
+    expect(fixture.getInvocationCount()).toBe(0);
+    await expect(
+      client.callTool({
+        name: options.callName,
+        arguments: options.callArguments,
+      }),
+    ).rejects.toThrow();
+    expect(fixture.getInvocationCount()).toBe(0);
+    expect(fixture.getInvocations()).toEqual([]);
+
+    await client.close();
+    await server.close();
+  }
+
+  it("raw downstream names cannot be invoked through the gateway and record zero invocations", async () => {
+    const { policyPath, guard } = writePolicy({
+      [RAW_DOWNSTREAM_NAME]: {
+        action: "ENFORCE",
+        argsSchema: structuredClone(transferArgsSchema),
+      },
+    });
+    const discovered: GuwahMediatedTool[] = [
+      {
+        name: RAW_DOWNSTREAM_NAME,
+        inputSchema: { type: "object", properties: { amountMinor: { type: "integer" } } },
+      },
+    ];
+    const mediated = applyGuwahToolNamespacing(mirrorAuthorizedGuwahTools(discovered, guard));
+    expect(mediated.map((tool) => tool.name)).toEqual([`guwah__${RAW_DOWNSTREAM_NAME}`]);
+
+    await expectZeroDownstreamDispatch({
+      policyPath,
+      mediatedTools: mediated,
+      callName: RAW_DOWNSTREAM_NAME,
+      callArguments: { amountMinor: 100 },
+    });
+  });
+
+  it("unmirrored tools cannot be invoked through the gateway and record zero invocations", async () => {
+    const { policyPath, guard } = writePolicy({
+      [RAW_DOWNSTREAM_NAME]: {
+        action: "ENFORCE",
+        argsSchema: structuredClone(transferArgsSchema),
+      },
+      [UNMIRRORED_NAME]: {
+        action: "ENFORCE",
+        argsSchema: structuredClone(transferArgsSchema),
+      },
+    });
+    const discovered: GuwahMediatedTool[] = [
+      {
+        name: RAW_DOWNSTREAM_NAME,
+        inputSchema: { type: "object", properties: { amountMinor: { type: "integer" } } },
+      },
+      // Policy lists UNMIRRORED_NAME, but discovery did not surface it for mirroring.
+    ];
+    const mediated = applyGuwahToolNamespacing(mirrorAuthorizedGuwahTools(discovered, guard));
+    expect(mediated.some((tool) => tool.downstreamName === UNMIRRORED_NAME)).toBe(false);
+    expect(mediated.some((tool) => tool.name.includes(UNMIRRORED_NAME))).toBe(false);
+
+    await expectZeroDownstreamDispatch({
+      policyPath,
+      mediatedTools: mediated,
+      callName: `guwah__${UNMIRRORED_NAME}`,
+      callArguments: { amountMinor: 100 },
+    });
+  });
+});
+
 describe("gateway start", () => {
   it("starts the compiled gateway process over stdio", async () => {
     expect(existsSync(GATEWAY_ENTRY)).toBe(true);
@@ -4102,6 +4518,178 @@ describe("gateway start", () => {
     expect(code).not.toBeNull();
     expect(spawned.stdout.join("")).not.toContain("result");
     expect(spawned.stdout.join("")).not.toMatch(/"id"\s*:\s*99/);
+  });
+});
+
+describe("sample versus active policy at startup", () => {
+  const configDirs: string[] = [];
+
+  afterEach(() => {
+    for (const dir of configDirs.splice(0, configDirs.length)) {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("binds stdio startup to the provisioned active path, not the packaged sample", async () => {
+    const configBaseDir = mkdtempSync(path.join(tmpdir(), "guwah-startup-active-"));
+    configDirs.push(configBaseDir);
+    const samplePolicyPath = resolveGuwahPackagedSamplePolicyPath();
+    const expectedActive = resolveGuwahActivePolicyPath({ configBaseDir });
+
+    const stdin = new PassThrough();
+    const stdout = new PassThrough();
+    const { server, activePolicyPath } = await startGuwahStdioGateway({
+      stdin,
+      stdout,
+      configBaseDir,
+      samplePolicyPath,
+      mediatedTools: [],
+      onTransportFailure: () => {
+        throw new Error("unexpected transport failure during active-policy startup");
+      },
+    });
+
+    expect(activePolicyPath).toBe(expectedActive);
+    expect(activePolicyPath).not.toBe(path.resolve(samplePolicyPath));
+    expect(existsSync(expectedActive)).toBe(true);
+    expect(existsSync(samplePolicyPath)).toBe(true);
+
+    await server.close();
+  });
+
+  it("does not validate against the packaged sample when an active user policy exists", async () => {
+    const configBaseDir = mkdtempSync(path.join(tmpdir(), "guwah-startup-prefer-active-"));
+    configDirs.push(configBaseDir);
+    const samplePolicyPath = resolveGuwahPackagedSamplePolicyPath();
+    const activePath = resolveGuwahActivePolicyPath({ configBaseDir });
+    mkdirSync(path.dirname(activePath), { recursive: true });
+    writeFileSync(
+      activePath,
+      `${JSON.stringify(
+        {
+          version: "1.0.0",
+          posture: "default-deny",
+          tools: {
+            coinbase_cdp_transfer: {
+              action: "ENFORCE",
+              argsSchema: {
+                $schema: "http://json-schema.org/draft-07/schema#",
+                type: "object",
+                additionalProperties: false,
+                required: ["amountMinor", "assetId", "destinationAddress", "memo"],
+                properties: {
+                  amountMinor: { type: "integer", minimum: 1, maximum: 100 },
+                  assetId: { type: "string", enum: ["USDC"] },
+                  destinationAddress: {
+                    type: "string",
+                    pattern: "^0x[0-9a-fA-F]{40}$",
+                    enum: ["0x1111111111111111111111111111111111111111"],
+                  },
+                  memo: {
+                    type: "string",
+                    minLength: 1,
+                    maxLength: 80,
+                    pattern: "^[A-Za-z0-9 .,_:-]+$",
+                  },
+                },
+              },
+            },
+          },
+        },
+        null,
+        2,
+      )}\n`,
+      "utf8",
+    );
+
+    const stdin = new PassThrough();
+    const stdout = new PassThrough();
+    const chunks: Buffer[] = [];
+    stdout.on("data", (chunk: Buffer) => {
+      chunks.push(Buffer.from(chunk));
+    });
+
+    const mediatedTransfer: GuwahMediatedTool = {
+      name: "coinbase_cdp_transfer",
+      inputSchema: {
+        type: "object",
+        additionalProperties: false,
+        required: ["amountMinor", "assetId", "destinationAddress", "memo"],
+        properties: {
+          amountMinor: { type: "integer" },
+          assetId: { type: "string" },
+          destinationAddress: { type: "string" },
+          memo: { type: "string" },
+        },
+      },
+    };
+
+    let dispatched = 0;
+    const { server, activePolicyPath } = await startGuwahStdioGateway({
+      stdin,
+      stdout,
+      configBaseDir,
+      samplePolicyPath,
+      policyPath: samplePolicyPath,
+      mediatedTools: [mediatedTransfer],
+      afterApproval: async () => {
+        dispatched += 1;
+        return { content: [{ type: "text", text: "ok" }] };
+      },
+      onTransportFailure: () => {
+        throw new Error("unexpected transport failure during sample-vs-active startup");
+      },
+    });
+
+    expect(activePolicyPath).toBe(activePath);
+    expect(activePolicyPath).not.toBe(path.resolve(samplePolicyPath));
+
+    stdin.write(
+      `${JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "initialize",
+        params: {
+          protocolVersion: "2025-11-25",
+          capabilities: {},
+          clientInfo: { name: "guwah-sample-vs-active", version: "0.0.0" },
+        },
+      })}\n`,
+    );
+    const initDeadline = Date.now() + 5000;
+    while (Date.now() < initDeadline && chunks.join("").trim().length === 0) {
+      await new Promise((resolve) => {
+        setTimeout(resolve, 25);
+      });
+    }
+    stdin.write(`${JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" })}\n`);
+    stdin.write(
+      `${JSON.stringify({
+        jsonrpc: "2.0",
+        id: 2,
+        method: "tools/call",
+        params: {
+          name: "coinbase_cdp_transfer",
+          arguments: {
+            amountMinor: 5000,
+            assetId: "USDC",
+            destinationAddress: "0x1111111111111111111111111111111111111111",
+            memo: "invoice 1001",
+          },
+        },
+      })}\n`,
+    );
+    const callDeadline = Date.now() + 5000;
+    while (Date.now() < callDeadline && !chunks.join("").includes('"id":2')) {
+      await new Promise((resolve) => {
+        setTimeout(resolve, 25);
+      });
+    }
+
+    expect(dispatched).toBe(0);
+    expect(chunks.join("")).toMatch(/ARGUMENT_VALIDATION_FAILED|guwahCode/);
+
+    await server.close();
   });
 });
 

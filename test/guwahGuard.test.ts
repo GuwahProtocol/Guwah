@@ -1,11 +1,22 @@
 import * as nodeFs from "node:fs";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  GUWAH_ACTIVE_POLICY_FILENAME,
+  GUWAH_ACTIVE_POLICY_PROVISION_ERROR,
+  GUWAH_ACTIVE_POLICY_SUBDIR,
+  GUWAH_SAMPLE_POLICY_UNAVAILABLE,
+  GUWAH_USER_CONFIG_DIR_UNAVAILABLE,
   GuwahGuard,
   GuwahSecurityViolation,
+  isGuwahPathInsideRoot,
+  provisionGuwahActivePolicy,
+  resolveGuwahActivePolicyPath,
+  resolveGuwahPackagedSamplePolicyPath,
+  resolveGuwahUserConfigBaseDir,
+  resolveGuwahLivePolicyPath,
   type GuwahGuardOptions,
   type GuwahViolationCode,
 } from "../src/guwahGuard.js";
@@ -1415,6 +1426,574 @@ describe("GuwahGuard", () => {
         "RESOURCE_LIMIT_EXCEEDED",
       );
       expect(nodeFs.closeSync).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe("active policy location", () => {
+    const locationDirs: string[] = [];
+
+    afterEach(() => {
+      for (const dir of locationDirs.splice(0, locationDirs.length)) {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("resolves active policy under an injected config base directory", () => {
+      const configBaseDir = mkdtempSync(path.join(tmpdir(), "guwah-config-base-"));
+      locationDirs.push(configBaseDir);
+      const resolved = resolveGuwahActivePolicyPath({ configBaseDir });
+      expect(path.isAbsolute(resolved)).toBe(true);
+      expect(resolved).toBe(
+        path.resolve(configBaseDir, GUWAH_ACTIVE_POLICY_SUBDIR, GUWAH_ACTIVE_POLICY_FILENAME),
+      );
+      expect(isGuwahPathInsideRoot(resolved, configBaseDir)).toBe(true);
+    });
+
+    it("rejects an empty injected config base directory", () => {
+      expect(() => resolveGuwahActivePolicyPath({ configBaseDir: "" })).toThrow(
+        /config base directory is required/i,
+      );
+      expect(() => resolveGuwahActivePolicyPath({ configBaseDir: "   " })).toThrow(
+        /config base directory is required/i,
+      );
+    });
+
+    it("keeps the active policy outside a replaced bundle tree", () => {
+      const root = mkdtempSync(path.join(tmpdir(), "guwah-bundle-upgrade-"));
+      locationDirs.push(root);
+      const bundleRoot = path.join(root, "mcpb-unpack");
+      const configBaseDir = path.join(root, "user-config");
+      mkdirSync(bundleRoot, { recursive: true });
+      mkdirSync(configBaseDir, { recursive: true });
+
+      const bundleSamplePath = path.join(bundleRoot, GUWAH_ACTIVE_POLICY_FILENAME);
+      writeFileSync(bundleSamplePath, `${JSON.stringify(transferPolicy(), null, 2)}\n`, "utf8");
+
+      const activePath = resolveGuwahActivePolicyPath({ configBaseDir });
+      mkdirSync(path.dirname(activePath), { recursive: true });
+      const activeDocument = `${JSON.stringify(
+        {
+          ...transferPolicy(),
+          tools: {
+            [TOOL_NAME]: {
+              action: "ENFORCE",
+              argsSchema: {
+                ...TRANSFER_SCHEMA,
+                properties: {
+                  ...TRANSFER_SCHEMA.properties,
+                  amountMinor: { type: "integer", minimum: 1, maximum: 2500 },
+                },
+              },
+            },
+          },
+        },
+        null,
+        2,
+      )}\n`;
+      writeFileSync(activePath, activeDocument, "utf8");
+
+      expect(isGuwahPathInsideRoot(activePath, bundleRoot)).toBe(false);
+      expect(isGuwahPathInsideRoot(activePath, configBaseDir)).toBe(true);
+
+      // Simulate a bundle upgrade that replaces unpack contents, including the sample.
+      rmSync(bundleRoot, { recursive: true, force: true });
+      mkdirSync(bundleRoot, { recursive: true });
+      writeFileSync(
+        path.join(bundleRoot, GUWAH_ACTIVE_POLICY_FILENAME),
+        `${JSON.stringify({ version: "1.0.0", posture: "default-deny", tools: {} }, null, 2)}\n`,
+        "utf8",
+      );
+
+      expect(readFileSync(activePath, "utf8")).toBe(activeDocument);
+      expect(isGuwahPathInsideRoot(activePath, bundleRoot)).toBe(false);
+
+      const guard = new GuwahGuard({ configBaseDir });
+      expect(guard.getActivePolicyPath()).toBe(activePath);
+      const args = {
+        amountMinor: 2500,
+        assetId: "USDC",
+        destinationAddress: WHITELISTED_DESTINATION,
+        memo: "invoice 1001",
+      };
+      expect(guard.validateToolCall(toolCallPayload(args), args).params.arguments).toEqual(args);
+    });
+
+    it("fails closed when the active policy file is missing under the config base", () => {
+      const configBaseDir = mkdtempSync(path.join(tmpdir(), "guwah-missing-active-"));
+      locationDirs.push(configBaseDir);
+      const instance = new GuwahGuard({ configBaseDir });
+      expect(isGuwahPathInsideRoot(instance.getActivePolicyPath(), configBaseDir)).toBe(true);
+      expectViolation(
+        () => instance.validateToolCall(toolCallPayload(compliantArgs()), compliantArgs()),
+        "POLICY_UNAVAILABLE",
+      );
+    });
+
+    it("does not default the active policy path into process.cwd()", () => {
+      if (process.platform !== "win32" && process.platform !== "darwin") {
+        expect(() => new GuwahGuard()).toThrow(GUWAH_USER_CONFIG_DIR_UNAVAILABLE);
+        return;
+      }
+      const instance = new GuwahGuard();
+      const activePath = instance.getActivePolicyPath();
+      const configBase = resolveGuwahUserConfigBaseDir();
+      expect(path.isAbsolute(activePath)).toBe(true);
+      expect(isGuwahPathInsideRoot(activePath, process.cwd())).toBe(false);
+      expect(activePath).toBe(resolveGuwahActivePolicyPath({ configBaseDir: configBase }));
+      expect(activePath).not.toBe(path.resolve(process.cwd(), GUWAH_ACTIVE_POLICY_FILENAME));
+    });
+  });
+
+  describe("platform user configuration directories", () => {
+    it("resolves Windows APPDATA as an absolute non-bundle config base", () => {
+      const injectedAppData = path.resolve(
+        path.join(tmpdir(), "guwah-win-appdata-", String(process.pid)),
+        "Roaming",
+      );
+      const resolved = resolveGuwahUserConfigBaseDir({
+        platform: "win32",
+        env: { APPDATA: injectedAppData },
+        tmpdir: path.join(tmpdir(), "guwah-win-tmp-elsewhere"),
+      });
+      expect(path.isAbsolute(resolved)).toBe(true);
+      expect(resolved).toBe(path.resolve(injectedAppData));
+      expect(isGuwahPathInsideRoot(resolved, process.cwd())).toBe(false);
+      const activePath = resolveGuwahActivePolicyPath({ configBaseDir: resolved });
+      expect(isGuwahPathInsideRoot(activePath, process.cwd())).toBe(false);
+    });
+
+    it("resolves macOS Application Support under the injected home directory", () => {
+      const injectedHome = path.resolve(
+        path.join(tmpdir(), "guwah-mac-home-", String(process.pid)),
+      );
+      const resolved = resolveGuwahUserConfigBaseDir({
+        platform: "darwin",
+        homedir: injectedHome,
+        tmpdir: path.join(tmpdir(), "guwah-mac-tmp-elsewhere"),
+      });
+      expect(path.isAbsolute(resolved)).toBe(true);
+      expect(resolved).toBe(path.resolve(injectedHome, "Library", "Application Support"));
+      expect(isGuwahPathInsideRoot(resolved, process.cwd())).toBe(false);
+      const activePath = resolveGuwahActivePolicyPath({ configBaseDir: resolved });
+      expect(activePath).toBe(
+        path.resolve(
+          injectedHome,
+          "Library",
+          "Application Support",
+          GUWAH_ACTIVE_POLICY_SUBDIR,
+          GUWAH_ACTIVE_POLICY_FILENAME,
+        ),
+      );
+    });
+
+    it("fails closed on unknown platforms instead of using tmp policy roots", () => {
+      const ephemeral = path.resolve(tmpdir(), "guwah-unknown-tmp");
+      expect(() =>
+        resolveGuwahUserConfigBaseDir({
+          platform: "linux",
+          tmpdir: ephemeral,
+          env: { TMPDIR: ephemeral, XDG_CONFIG_HOME: ephemeral },
+          homedir: path.join(ephemeral, "home"),
+        }),
+      ).toThrow(GUWAH_USER_CONFIG_DIR_UNAVAILABLE);
+      expect(() =>
+        resolveGuwahUserConfigBaseDir({
+          platform: "freebsd",
+          tmpdir: ephemeral,
+        }),
+      ).toThrow(GUWAH_USER_CONFIG_DIR_UNAVAILABLE);
+    });
+
+    it("fails closed when Windows APPDATA is missing or ephemeral", () => {
+      expect(() =>
+        resolveGuwahUserConfigBaseDir({
+          platform: "win32",
+          env: {},
+        }),
+      ).toThrow(GUWAH_USER_CONFIG_DIR_UNAVAILABLE);
+      expect(() =>
+        resolveGuwahUserConfigBaseDir({
+          platform: "win32",
+          env: { APPDATA: "   " },
+        }),
+      ).toThrow(GUWAH_USER_CONFIG_DIR_UNAVAILABLE);
+
+      const ephemeralRoot = path.resolve(tmpdir(), "guwah-appdata-in-tmp");
+      expect(() =>
+        resolveGuwahUserConfigBaseDir({
+          platform: "win32",
+          env: { APPDATA: path.join(ephemeralRoot, "Roaming") },
+          tmpdir: ephemeralRoot,
+        }),
+      ).toThrow(GUWAH_USER_CONFIG_DIR_UNAVAILABLE);
+    });
+
+    it("fails closed when macOS home is missing or resolves under tmp", () => {
+      expect(() =>
+        resolveGuwahUserConfigBaseDir({
+          platform: "darwin",
+          homedir: "",
+        }),
+      ).toThrow(GUWAH_USER_CONFIG_DIR_UNAVAILABLE);
+
+      const ephemeralRoot = path.resolve(tmpdir(), "guwah-mac-home-in-tmp");
+      expect(() =>
+        resolveGuwahUserConfigBaseDir({
+          platform: "darwin",
+          homedir: path.join(ephemeralRoot, "Users", "demo"),
+          tmpdir: ephemeralRoot,
+        }),
+      ).toThrow(GUWAH_USER_CONFIG_DIR_UNAVAILABLE);
+    });
+
+    it("uses the live Windows config base when running on win32", () => {
+      if (process.platform !== "win32") {
+        return;
+      }
+      const resolved = resolveGuwahUserConfigBaseDir();
+      expect(path.isAbsolute(resolved)).toBe(true);
+      expect(resolved).toBe(path.resolve(String(process.env["APPDATA"])));
+      expect(isGuwahPathInsideRoot(resolved, process.cwd())).toBe(false);
+      expect(isGuwahPathInsideRoot(resolved, tmpdir())).toBe(false);
+    });
+
+    it("uses the live macOS Application Support base when running on darwin", () => {
+      if (process.platform !== "darwin") {
+        return;
+      }
+      const resolved = resolveGuwahUserConfigBaseDir();
+      expect(path.isAbsolute(resolved)).toBe(true);
+      expect(resolved).toBe(path.resolve(homedir(), "Library", "Application Support"));
+      expect(isGuwahPathInsideRoot(resolved, process.cwd())).toBe(false);
+      expect(isGuwahPathInsideRoot(resolved, tmpdir())).toBe(false);
+    });
+  });
+
+  describe("first-run policy provisioning", () => {
+    const provisionDirs: string[] = [];
+
+    afterEach(() => {
+      vi.restoreAllMocks();
+      for (const dir of provisionDirs.splice(0, provisionDirs.length)) {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("creates a valid active policy from the sample on first run", () => {
+      const configBaseDir = mkdtempSync(path.join(tmpdir(), "guwah-provision-first-"));
+      provisionDirs.push(configBaseDir);
+      const samplePolicyPath = resolveGuwahPackagedSamplePolicyPath();
+      expect(nodeFs.existsSync(samplePolicyPath)).toBe(true);
+
+      const result = provisionGuwahActivePolicy({ configBaseDir, samplePolicyPath });
+      expect(result.created).toBe(true);
+      expect(result.policyPath).toBe(resolveGuwahActivePolicyPath({ configBaseDir }));
+      expect(nodeFs.existsSync(result.policyPath)).toBe(true);
+
+      const guard = new GuwahGuard({ policyPath: result.policyPath });
+      const args = compliantArgs();
+      expect(guard.validateToolCall(toolCallPayload(args), args).params.arguments).toEqual(args);
+    });
+
+    it("does not overwrite an existing active policy on second run", () => {
+      const configBaseDir = mkdtempSync(path.join(tmpdir(), "guwah-provision-second-"));
+      provisionDirs.push(configBaseDir);
+      const samplePolicyPath = resolveGuwahPackagedSamplePolicyPath();
+      const first = provisionGuwahActivePolicy({ configBaseDir, samplePolicyPath });
+      expect(first.created).toBe(true);
+
+      const customized = `${JSON.stringify(
+        {
+          version: "1.0.0",
+          posture: "default-deny",
+          tools: {
+            [TOOL_NAME]: {
+              action: "ENFORCE",
+              argsSchema: {
+                ...TRANSFER_SCHEMA,
+                properties: {
+                  ...TRANSFER_SCHEMA.properties,
+                  amountMinor: { type: "integer", minimum: 1, maximum: 100 },
+                },
+              },
+            },
+          },
+        },
+        null,
+        2,
+      )}\n`;
+      writeFileSync(first.policyPath, customized, "utf8");
+
+      const second = provisionGuwahActivePolicy({ configBaseDir, samplePolicyPath });
+      expect(second.created).toBe(false);
+      expect(second.policyPath).toBe(first.policyPath);
+      expect(readFileSync(first.policyPath, "utf8")).toBe(customized);
+    });
+
+    it("leaves no active file when the sample cannot be read", () => {
+      const configBaseDir = mkdtempSync(path.join(tmpdir(), "guwah-provision-missing-sample-"));
+      provisionDirs.push(configBaseDir);
+      const activePath = resolveGuwahActivePolicyPath({ configBaseDir });
+      const missingSample = path.join(configBaseDir, "missing-sample.json");
+
+      expect(() =>
+        provisionGuwahActivePolicy({
+          configBaseDir,
+          samplePolicyPath: missingSample,
+        }),
+      ).toThrow(GUWAH_SAMPLE_POLICY_UNAVAILABLE);
+      expect(nodeFs.existsSync(activePath)).toBe(false);
+    });
+
+    it("removes a half-written destination when exclusive copy fails", () => {
+      const configBaseDir = mkdtempSync(path.join(tmpdir(), "guwah-provision-copy-fail-"));
+      provisionDirs.push(configBaseDir);
+      const samplePolicyPath = resolveGuwahPackagedSamplePolicyPath();
+      const activePath = resolveGuwahActivePolicyPath({ configBaseDir });
+
+      const copySpy = vi.spyOn(nodeFs, "copyFileSync").mockImplementation(((
+        _src: nodeFs.PathLike,
+        dest: nodeFs.PathLike,
+      ) => {
+        nodeFs.writeFileSync(dest, "{", "utf8");
+        const error = new Error("simulated copy failure") as NodeJS.ErrnoException;
+        error.code = "EIO";
+        throw error;
+      }) as typeof nodeFs.copyFileSync);
+
+      expect(() =>
+        provisionGuwahActivePolicy({ configBaseDir, samplePolicyPath }),
+      ).toThrow(GUWAH_ACTIVE_POLICY_PROVISION_ERROR);
+      expect(copySpy).toHaveBeenCalled();
+      expect(nodeFs.existsSync(activePath)).toBe(false);
+
+      const leftoverTemps = nodeFs
+        .readdirSync(path.join(configBaseDir, GUWAH_ACTIVE_POLICY_SUBDIR), { withFileTypes: true })
+        .filter((entry) => entry.isFile() && entry.name.endsWith(".tmp"));
+      expect(leftoverTemps).toEqual([]);
+    });
+  });
+
+  describe("active policy preservation", () => {
+    const preserveDirs: string[] = [];
+
+    afterEach(() => {
+      for (const dir of preserveDirs.splice(0, preserveDirs.length)) {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("preserves operator edits across restart and sample upgrade without silent tool merge", () => {
+      const root = mkdtempSync(path.join(tmpdir(), "guwah-upgrade-preserve-"));
+      preserveDirs.push(root);
+      const configBaseDir = path.join(root, "user-config");
+      const bundleRoot = path.join(root, "package-v1");
+      mkdirSync(configBaseDir, { recursive: true });
+      mkdirSync(bundleRoot, { recursive: true });
+
+      const sampleV1Path = path.join(bundleRoot, GUWAH_ACTIVE_POLICY_FILENAME);
+      const sampleV1 = {
+        version: "1.0.0",
+        posture: "default-deny",
+        tools: {
+          [TOOL_NAME]: {
+            action: "ENFORCE",
+            argsSchema: structuredClone(TRANSFER_SCHEMA),
+          },
+        },
+      };
+      writeFileSync(sampleV1Path, `${JSON.stringify(sampleV1, null, 2)}\n`, "utf8");
+
+      const first = provisionGuwahActivePolicy({
+        configBaseDir,
+        samplePolicyPath: sampleV1Path,
+      });
+      expect(first.created).toBe(true);
+
+      // Operator edit: tighten the limit and keep only the original tool.
+      const operatorEdit = {
+        version: "1.0.0",
+        posture: "default-deny",
+        tools: {
+          [TOOL_NAME]: {
+            action: "ENFORCE",
+            argsSchema: {
+              ...TRANSFER_SCHEMA,
+              properties: {
+                ...TRANSFER_SCHEMA.properties,
+                amountMinor: { type: "integer", minimum: 1, maximum: 100 },
+              },
+            },
+          },
+        },
+      };
+      const operatorEditJson = `${JSON.stringify(operatorEdit, null, 2)}\n`;
+      writeFileSync(first.policyPath, operatorEditJson, "utf8");
+
+      // Restart: live resolution must reuse the active file without rewriting it.
+      const restartedPath = resolveGuwahLivePolicyPath({
+        configBaseDir,
+        samplePolicyPath: sampleV1Path,
+      });
+      expect(restartedPath).toBe(first.policyPath);
+      expect(readFileSync(first.policyPath, "utf8")).toBe(operatorEditJson);
+
+      // Upgrade: replace the packaged sample with a richer document that adds a tool.
+      const upgradedBundle = path.join(root, "package-v2");
+      mkdirSync(upgradedBundle, { recursive: true });
+      const sampleV2Path = path.join(upgradedBundle, GUWAH_ACTIVE_POLICY_FILENAME);
+      const extraToolName = "extra_upgrade_tool";
+      const sampleV2 = {
+        version: "1.0.0",
+        posture: "default-deny",
+        tools: {
+          [TOOL_NAME]: {
+            action: "ENFORCE",
+            argsSchema: structuredClone(TRANSFER_SCHEMA),
+          },
+          [extraToolName]: {
+            action: "ENFORCE",
+            argsSchema: {
+              $schema: "http://json-schema.org/draft-07/schema#",
+              type: "object",
+              additionalProperties: false,
+              properties: {},
+            },
+          },
+        },
+      };
+      writeFileSync(sampleV2Path, `${JSON.stringify(sampleV2, null, 2)}\n`, "utf8");
+      rmSync(bundleRoot, { recursive: true, force: true });
+
+      const afterUpgrade = provisionGuwahActivePolicy({
+        configBaseDir,
+        samplePolicyPath: sampleV2Path,
+      });
+      expect(afterUpgrade.created).toBe(false);
+      expect(afterUpgrade.policyPath).toBe(first.policyPath);
+      expect(readFileSync(first.policyPath, "utf8")).toBe(operatorEditJson);
+
+      const liveAfterUpgrade = resolveGuwahLivePolicyPath({
+        configBaseDir,
+        samplePolicyPath: sampleV2Path,
+      });
+      expect(liveAfterUpgrade).toBe(first.policyPath);
+      expect(readFileSync(first.policyPath, "utf8")).toBe(operatorEditJson);
+
+      const guard = new GuwahGuard({ policyPath: first.policyPath });
+      expect(guard.listEnforcedToolNames()).toEqual([TOOL_NAME]);
+      expect(guard.listEnforcedToolNames()).not.toContain(extraToolName);
+
+      const overLimit = { ...compliantArgs(), amountMinor: 5000 };
+      expectViolation(
+        () => guard.validateToolCall(toolCallPayload(overLimit), overLimit),
+        "ARGUMENT_VALIDATION_FAILED",
+      );
+      expectViolation(
+        () =>
+          guard.validateToolCall(
+            {
+              jsonrpc: "2.0",
+              id: "req-extra",
+              method: "tools/call",
+              params: {
+                name: extraToolName,
+                arguments: {},
+              },
+            },
+            {},
+          ),
+        "UNAUTHORIZED_TOOL",
+      );
+
+      const allowed = { ...compliantArgs(), amountMinor: 100 };
+      expect(guard.validateToolCall(toolCallPayload(allowed), allowed).params.arguments).toEqual(
+        allowed,
+      );
+    });
+  });
+
+  describe("sample versus active policy", () => {
+    const separationDirs: string[] = [];
+
+    afterEach(() => {
+      for (const dir of separationDirs.splice(0, separationDirs.length)) {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("resolves live startup to the active path after provisioning, not the packaged sample", () => {
+      const configBaseDir = mkdtempSync(path.join(tmpdir(), "guwah-live-active-"));
+      separationDirs.push(configBaseDir);
+      const samplePolicyPath = resolveGuwahPackagedSamplePolicyPath();
+      const livePath = resolveGuwahLivePolicyPath({ configBaseDir, samplePolicyPath });
+      const activePath = resolveGuwahActivePolicyPath({ configBaseDir });
+
+      expect(livePath).toBe(activePath);
+      expect(livePath).not.toBe(path.resolve(samplePolicyPath));
+      expect(nodeFs.existsSync(livePath)).toBe(true);
+      expect(isGuwahPathInsideRoot(livePath, configBaseDir)).toBe(true);
+
+      const guard = new GuwahGuard({ policyPath: livePath });
+      expect(guard.getActivePolicyPath()).toBe(activePath);
+      const args = compliantArgs();
+      expect(guard.validateToolCall(toolCallPayload(args), args).params.arguments).toEqual(args);
+    });
+
+    it("prefers an existing active file over the packaged sample when both are present", () => {
+      const root = mkdtempSync(path.join(tmpdir(), "guwah-sample-vs-active-"));
+      separationDirs.push(root);
+      const configBaseDir = path.join(root, "user-config");
+      const bundleRoot = path.join(root, "package");
+      mkdirSync(configBaseDir, { recursive: true });
+      mkdirSync(bundleRoot, { recursive: true });
+
+      const samplePolicyPath = path.join(bundleRoot, GUWAH_ACTIVE_POLICY_FILENAME);
+      writeFileSync(samplePolicyPath, `${JSON.stringify(transferPolicy(), null, 2)}\n`, "utf8");
+
+      const activePath = resolveGuwahActivePolicyPath({ configBaseDir });
+      mkdirSync(path.dirname(activePath), { recursive: true });
+      const activeOnly = `${JSON.stringify(
+        {
+          version: "1.0.0",
+          posture: "default-deny",
+          tools: {
+            [TOOL_NAME]: {
+              action: "ENFORCE",
+              argsSchema: {
+                ...TRANSFER_SCHEMA,
+                properties: {
+                  ...TRANSFER_SCHEMA.properties,
+                  amountMinor: { type: "integer", minimum: 1, maximum: 100 },
+                },
+              },
+            },
+          },
+        },
+        null,
+        2,
+      )}\n`;
+      writeFileSync(activePath, activeOnly, "utf8");
+
+      const livePath = resolveGuwahLivePolicyPath({
+        configBaseDir,
+        samplePolicyPath,
+        policyPath: samplePolicyPath,
+      });
+      expect(livePath).toBe(activePath);
+      expect(livePath).not.toBe(path.resolve(samplePolicyPath));
+
+      const guard = new GuwahGuard({ policyPath: livePath });
+      expectViolation(
+        () =>
+          guard.validateToolCall(
+            toolCallPayload({ ...compliantArgs(), amountMinor: 5000 }),
+            { ...compliantArgs(), amountMinor: 5000 },
+          ),
+        "ARGUMENT_VALIDATION_FAILED",
+      );
+      const args = { ...compliantArgs(), amountMinor: 100 };
+      expect(guard.validateToolCall(toolCallPayload(args), args).params.arguments).toEqual(args);
     });
   });
 });

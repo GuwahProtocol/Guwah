@@ -15,7 +15,13 @@ import {
   type ServerCapabilities,
   type Tool,
 } from "@modelcontextprotocol/sdk/types.js";
-import { GuwahGuard, GuwahSecurityViolation, type GuwahViolationCode, type McpToolCallPayload } from "./guwahGuard.js";
+import {
+  GuwahGuard,
+  GuwahSecurityViolation,
+  resolveGuwahLivePolicyPath,
+  type GuwahViolationCode,
+  type McpToolCallPayload,
+} from "./guwahGuard.js";
 
 export const GUWAH_GATEWAY_NAME = "guwah";
 export const GUWAH_GATEWAY_VERSION = "0.1.0";
@@ -455,6 +461,17 @@ export type GuwahStdioGatewayOptions = {
   readonly resolveMediatedTools?: () => readonly GuwahMediatedTool[];
   readonly beforeResolveMediatedTools?: () => void | Promise<void>;
   readonly policyPath?: string;
+  /**
+   * Per-user configuration directory root for active-policy resolution and first-run
+   * provisioning. Ignored when `guard` is set. When omitted with no `policyPath`, the
+   * platform user-config base is used.
+   */
+  readonly configBaseDir?: string;
+  /**
+   * Optional packaged sample path for first-run provisioning. Defaults to the package
+   * sample. The sample is never the live file when a distinct active policy exists.
+   */
+  readonly samplePolicyPath?: string;
   readonly guard?: GuwahGuard;
   readonly afterApproval?: GuwahAfterApprovalHandler;
   /**
@@ -2036,19 +2053,54 @@ export async function startGuwahStdioGateway(
   readonly server: Server;
   readonly transport: StdioServerTransport;
   readonly downstream?: GuwahDownstreamConnection;
+  /** Absolute path of the live active policy used by this gateway process. */
+  readonly activePolicyPath?: string;
 }> {
+  // Reject invalid concurrency bounds before provisioning or connecting.
+  const maxConcurrentCalls = resolveMaxConcurrentCalls(options?.maxConcurrentCalls);
+
+  // Validate downstream transport config before provisioning so bad config fails closed
+  // without touching the active policy path.
+  const downstreamConfig =
+    options?.downstreamTransportConfigPath !== undefined
+      ? loadGuwahDownstreamTransportConfig(options.downstreamTransportConfigPath)
+      : undefined;
+
   // Missing path => deny-all (no implicit localhost). Provided path must validate and connect.
   let downstreamConnection: GuwahDownstreamConnection | undefined;
   let lastDiscoveredTools: readonly GuwahMediatedTool[] | undefined;
   let mirroredMediatedTools: readonly GuwahMediatedTool[] | undefined;
   let discoveryGuard: GuwahGuard | undefined;
-  if (options?.downstreamTransportConfigPath !== undefined) {
-    const downstreamConfig = loadGuwahDownstreamTransportConfig(
-      options.downstreamTransportConfigPath,
-    );
+  let activePolicyPath: string | undefined;
+  if (options?.guard !== undefined) {
+    activePolicyPath = options.guard.getActivePolicyPath();
+  } else {
+    const liveOptions: {
+      configBaseDir?: string;
+      samplePolicyPath?: string;
+      policyPath?: string;
+    } = {};
+    if (options?.configBaseDir !== undefined) {
+      liveOptions.configBaseDir = options.configBaseDir;
+    }
+    if (options?.samplePolicyPath !== undefined) {
+      liveOptions.samplePolicyPath = options.samplePolicyPath;
+    }
+    if (options?.policyPath !== undefined) {
+      liveOptions.policyPath = options.policyPath;
+    }
+    // Stdio startup provisions and binds the active path, not the packaged sample.
+    activePolicyPath = resolveGuwahLivePolicyPath(liveOptions);
+  }
+  if (downstreamConfig !== undefined) {
     // Failed connect must not proceed to a tool-exposing gateway server.
     downstreamConnection = await connectGuwahDownstream(downstreamConfig);
-    discoveryGuard = resolveGuard(options);
+    discoveryGuard =
+      options?.guard !== undefined
+        ? options.guard
+        : new GuwahGuard({
+            policyPath: activePolicyPath,
+          });
     const discovered = await discoverGuwahDownstreamTools(downstreamConnection);
     lastDiscoveredTools = discovered;
     // Gateway tools/list is policy ∩ discovery; extras are omitted, never auto-authorized.
@@ -2076,7 +2128,6 @@ export async function startGuwahStdioGateway(
   const stdinStream = options?.stdin ?? process.stdin;
   const stdoutStream = options?.stdout ?? process.stdout;
   const shutdownGraceMs = resolveShutdownGraceMs(options?.shutdownGraceMs);
-  const maxConcurrentCalls = resolveMaxConcurrentCalls(options?.maxConcurrentCalls);
   let acceptingNewMessages = true;
   let outboundClosed = false;
   let activeDispatches = 0;
@@ -2148,6 +2199,9 @@ export async function startGuwahStdioGateway(
         });
   const serverOptions = buildServerOptionsFromStdio({
     ...options,
+    ...(options?.guard === undefined && activePolicyPath !== undefined
+      ? { policyPath: activePolicyPath }
+      : {}),
     ...(mirroredMediatedTools !== undefined
       ? {
           resolveMediatedTools: () => mirroredMediatedTools ?? Object.freeze([]),
@@ -2342,9 +2396,13 @@ export async function startGuwahStdioGateway(
   }) as typeof transport.send;
 
   if (downstreamConnection === undefined) {
-    return { server, transport };
+    return activePolicyPath === undefined
+      ? { server, transport }
+      : { server, transport, activePolicyPath };
   }
-  return { server, transport, downstream: downstreamConnection };
+  return activePolicyPath === undefined
+    ? { server, transport, downstream: downstreamConnection }
+    : { server, transport, downstream: downstreamConnection, activePolicyPath };
 }
 
 function isGatewayEntry(): boolean {

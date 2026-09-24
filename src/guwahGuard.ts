@@ -1,6 +1,8 @@
 import { createHash } from "node:crypto";
 import * as nodeFs from "node:fs";
+import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import AjvImport from "ajv";
 import type {
   AnySchemaObject,
@@ -62,8 +64,319 @@ export interface GuwahResourceLimits {
 }
 
 export interface GuwahGuardOptions {
+  /**
+   * Explicit active policy file path. When set, takes precedence over `configBaseDir`.
+   */
   readonly policyPath?: string;
+  /**
+   * Per-user configuration directory root. Active policy resolves under this root,
+   * outside replaceable package/MCPB contents. Ignored when `policyPath` is set.
+   */
+  readonly configBaseDir?: string;
   readonly resourceLimits?: Partial<GuwahResourceLimits>;
+}
+
+/** Filename of the operator-owned active policy document. */
+export const GUWAH_ACTIVE_POLICY_FILENAME = "guwah-policy.json";
+
+/**
+ * Product subdirectory under the injected configuration base directory.
+ * Keeps the active file out of replaceable bundle trees by default.
+ */
+export const GUWAH_ACTIVE_POLICY_SUBDIR = "guwah";
+
+export type GuwahActivePolicyPathOptions = {
+  readonly configBaseDir: string;
+};
+
+/**
+ * Resolves the active policy path under a per-user configuration directory.
+ * The active file is not stored inside replaceable package or MCPB unpack trees,
+ * so replacing those trees does not overwrite the active file by default.
+ */
+export function resolveGuwahActivePolicyPath(
+  options: GuwahActivePolicyPathOptions,
+): string {
+  const configBaseDir = options.configBaseDir;
+  if (typeof configBaseDir !== "string" || configBaseDir.trim() === "") {
+    throw new Error("Guwah config base directory is required.");
+  }
+  return path.resolve(
+    configBaseDir,
+    GUWAH_ACTIVE_POLICY_SUBDIR,
+    GUWAH_ACTIVE_POLICY_FILENAME,
+  );
+}
+
+/**
+ * Returns true when `candidatePath` resolves strictly inside `rootPath`.
+ * Used to prove the active policy path is outside a bundle or unpack root.
+ */
+export function isGuwahPathInsideRoot(candidatePath: string, rootPath: string): boolean {
+  const resolvedCandidate = path.resolve(candidatePath);
+  const resolvedRoot = path.resolve(rootPath);
+  const relative = path.relative(resolvedRoot, resolvedCandidate);
+  return relative !== "" && !relative.startsWith("..") && !path.isAbsolute(relative);
+}
+
+export const GUWAH_USER_CONFIG_DIR_UNAVAILABLE =
+  "Guwah user configuration directory is unavailable.";
+
+export type GuwahUserConfigDirOptions = {
+  /** Injected platform id for tests. Defaults to `process.platform`. */
+  readonly platform?: NodeJS.Platform;
+  /** Injected environment map for tests. Defaults to `process.env`. */
+  readonly env?: NodeJS.ProcessEnv;
+  /** Injected home directory for tests. Defaults to `os.homedir()`. */
+  readonly homedir?: string;
+  /** Injected temp directory used only to reject ephemeral bases. Defaults to `os.tmpdir()`. */
+  readonly tmpdir?: string;
+};
+
+/**
+ * Resolves the per-user configuration base directory using platform conventions.
+ * Windows: `%APPDATA%` (roaming application data).
+ * macOS: `~/Library/Application Support`.
+ * Unknown platforms fail closed; `/tmp` and other ephemeral roots are never used.
+ */
+export function resolveGuwahUserConfigBaseDir(
+  options?: GuwahUserConfigDirOptions,
+): string {
+  const platform = options?.platform ?? process.platform;
+  const env = options?.env ?? process.env;
+  const homedirValue = options?.homedir ?? os.homedir();
+  const tmpdirValue = options?.tmpdir ?? os.tmpdir();
+
+  let resolved: string;
+  if (platform === "win32") {
+    const appData = env["APPDATA"];
+    if (typeof appData !== "string" || appData.trim() === "") {
+      throw new Error(GUWAH_USER_CONFIG_DIR_UNAVAILABLE);
+    }
+    resolved = path.resolve(appData);
+  } else if (platform === "darwin") {
+    if (typeof homedirValue !== "string" || homedirValue.trim() === "") {
+      throw new Error(GUWAH_USER_CONFIG_DIR_UNAVAILABLE);
+    }
+    resolved = path.resolve(homedirValue, "Library", "Application Support");
+  } else {
+    // Unsupported host: fail closed rather than falling back to /tmp or cwd.
+    throw new Error(GUWAH_USER_CONFIG_DIR_UNAVAILABLE);
+  }
+
+  if (!path.isAbsolute(resolved)) {
+    throw new Error(GUWAH_USER_CONFIG_DIR_UNAVAILABLE);
+  }
+
+  const resolvedTmp = path.resolve(tmpdirValue);
+  if (resolved === resolvedTmp || isGuwahPathInsideRoot(resolved, resolvedTmp)) {
+    throw new Error(GUWAH_USER_CONFIG_DIR_UNAVAILABLE);
+  }
+
+  return resolved;
+}
+
+export const GUWAH_SAMPLE_POLICY_UNAVAILABLE = "Guwah sample policy is unavailable.";
+export const GUWAH_ACTIVE_POLICY_PROVISION_ERROR =
+  "Guwah active policy provisioning failed.";
+
+export type GuwahPackagedSamplePolicyPathOptions = {
+  /** Injected module URL for tests. Defaults to this module's `import.meta.url`. */
+  readonly moduleUrl?: string;
+};
+
+/**
+ * Resolves the packaged sample policy beside the published package root.
+ * This sample is not the live active file; first-run provisioning copies it when absent.
+ */
+export function resolveGuwahPackagedSamplePolicyPath(
+  options?: GuwahPackagedSamplePolicyPathOptions,
+): string {
+  const moduleUrl = options?.moduleUrl ?? import.meta.url;
+  return path.resolve(
+    path.dirname(fileURLToPath(moduleUrl)),
+    "..",
+    GUWAH_ACTIVE_POLICY_FILENAME,
+  );
+}
+
+export type GuwahProvisionActivePolicyOptions = {
+  readonly configBaseDir?: string;
+  readonly policyPath?: string;
+  readonly samplePolicyPath?: string;
+};
+
+export type GuwahProvisionActivePolicyResult = {
+  readonly policyPath: string;
+  readonly created: boolean;
+};
+
+/**
+ * Copies the packaged sample policy to the active path only when that file is absent.
+ * Second and later runs leave an existing active file unchanged.
+ * Failed copies remove incomplete temp or destination bytes so they are not trusted.
+ */
+export function provisionGuwahActivePolicy(
+  options?: GuwahProvisionActivePolicyOptions,
+): GuwahProvisionActivePolicyResult {
+  const policyPath =
+    options?.policyPath !== undefined
+      ? path.resolve(options.policyPath)
+      : resolveGuwahActivePolicyPath({
+          configBaseDir:
+            options?.configBaseDir !== undefined
+              ? options.configBaseDir
+              : resolveGuwahUserConfigBaseDir(),
+        });
+
+  if (nodeFs.existsSync(policyPath)) {
+    let stats: nodeFs.Stats;
+    try {
+      stats = nodeFs.statSync(policyPath);
+    } catch {
+      throw new Error(GUWAH_ACTIVE_POLICY_PROVISION_ERROR);
+    }
+    if (!stats.isFile()) {
+      throw new Error(GUWAH_ACTIVE_POLICY_PROVISION_ERROR);
+    }
+    // Presence skips provisioning: no overwrite, no silent merge of sample tools.
+    return Object.freeze({ policyPath, created: false });
+  }
+
+  const samplePolicyPath =
+    options?.samplePolicyPath !== undefined
+      ? path.resolve(options.samplePolicyPath)
+      : resolveGuwahPackagedSamplePolicyPath();
+
+  let sampleStats: nodeFs.Stats;
+  try {
+    sampleStats = nodeFs.statSync(samplePolicyPath);
+  } catch {
+    throw new Error(GUWAH_SAMPLE_POLICY_UNAVAILABLE);
+  }
+  if (!sampleStats.isFile()) {
+    throw new Error(GUWAH_SAMPLE_POLICY_UNAVAILABLE);
+  }
+
+  let sampleBytes: Buffer;
+  try {
+    sampleBytes = nodeFs.readFileSync(samplePolicyPath);
+  } catch {
+    throw new Error(GUWAH_SAMPLE_POLICY_UNAVAILABLE);
+  }
+
+  const directory = path.dirname(policyPath);
+  try {
+    nodeFs.mkdirSync(directory, { recursive: true });
+  } catch {
+    throw new Error(GUWAH_ACTIVE_POLICY_PROVISION_ERROR);
+  }
+
+  if (nodeFs.existsSync(policyPath)) {
+    return Object.freeze({ policyPath, created: false });
+  }
+
+  const tempPath = path.join(
+    directory,
+    `.${GUWAH_ACTIVE_POLICY_FILENAME}.${String(process.pid)}.${String(Date.now())}.tmp`,
+  );
+
+  try {
+    nodeFs.writeFileSync(tempPath, sampleBytes, { flag: "wx" });
+    try {
+      nodeFs.copyFileSync(tempPath, policyPath, nodeFs.constants.COPYFILE_EXCL);
+    } catch (copyError: unknown) {
+      const code =
+        typeof copyError === "object" &&
+        copyError !== null &&
+        "code" in copyError &&
+        typeof (copyError as { code?: unknown }).code === "string"
+          ? (copyError as { code: string }).code
+          : undefined;
+      if (code === "EEXIST") {
+        return Object.freeze({ policyPath, created: false });
+      }
+      // Incomplete destination bytes must not become the trusted active file.
+      try {
+        if (nodeFs.existsSync(policyPath)) {
+          nodeFs.unlinkSync(policyPath);
+        }
+      } catch {
+        // Best-effort removal of a half-written destination.
+      }
+      throw new Error(GUWAH_ACTIVE_POLICY_PROVISION_ERROR);
+    }
+  } catch (error: unknown) {
+    if (error instanceof Error && error.message === GUWAH_ACTIVE_POLICY_PROVISION_ERROR) {
+      throw error;
+    }
+    if (error instanceof Error && error.message === GUWAH_SAMPLE_POLICY_UNAVAILABLE) {
+      throw error;
+    }
+    throw new Error(GUWAH_ACTIVE_POLICY_PROVISION_ERROR);
+  } finally {
+    try {
+      if (nodeFs.existsSync(tempPath)) {
+        nodeFs.unlinkSync(tempPath);
+      }
+    } catch {
+      // Best-effort temp cleanup; temp names are never the active path.
+    }
+  }
+
+  if (!nodeFs.existsSync(policyPath)) {
+    throw new Error(GUWAH_ACTIVE_POLICY_PROVISION_ERROR);
+  }
+
+  return Object.freeze({ policyPath, created: true });
+}
+
+export type GuwahLivePolicyPathOptions = GuwahProvisionActivePolicyOptions & {
+  /**
+   * Explicit policy path. When this resolves to the packaged sample and an active
+   * user-config policy already exists, the active path is used instead.
+   */
+  readonly policyPath?: string;
+};
+
+/**
+ * Resolves the live policy path for startup.
+ * Provisions the active file when absent. Never uses the packaged sample as the
+ * live file when a distinct active policy already exists under user config.
+ */
+export function resolveGuwahLivePolicyPath(
+  options?: GuwahLivePolicyPathOptions,
+): string {
+  const samplePolicyPath = path.resolve(
+    options?.samplePolicyPath !== undefined
+      ? options.samplePolicyPath
+      : resolveGuwahPackagedSamplePolicyPath(),
+  );
+
+  const configBaseDir =
+    options?.configBaseDir !== undefined
+      ? options.configBaseDir
+      : resolveGuwahUserConfigBaseDir();
+  const activePath = resolveGuwahActivePolicyPath({ configBaseDir });
+
+  if (options?.policyPath !== undefined) {
+    const requested = path.resolve(options.policyPath);
+    if (
+      requested === samplePolicyPath &&
+      activePath !== samplePolicyPath &&
+      nodeFs.existsSync(activePath)
+    ) {
+      // User-config active exists: never validate against the writable package sample.
+      return activePath;
+    }
+    return requested;
+  }
+
+  return provisionGuwahActivePolicy(
+    options?.samplePolicyPath !== undefined
+      ? { configBaseDir, samplePolicyPath: options.samplePolicyPath }
+      : { configBaseDir },
+  ).policyPath;
 }
 
 export type GuwahViolationCode =
@@ -145,7 +458,6 @@ const REQUIRED_POLICY_POSTURE = "default-deny";
 const ENFORCE_ACTION = "ENFORCE";
 const DENY_ACTION = "DENY";
 const KNOWN_TOOL_ACTIONS = new Set<string>([ENFORCE_ACTION, DENY_ACTION]);
-const DEFAULT_POLICY_FILENAME = "guwah-policy.json";
 const LOCAL_DRAFT07_SCHEMA_IDS = new Set<string>([
   "http://json-schema.org/draft-07/schema#",
   "http://json-schema.org/draft-07/schema",
@@ -1530,14 +1842,26 @@ export class GuwahGuard {
   private cache: CompiledPolicyCache | undefined;
 
   public constructor(options?: GuwahGuardOptions) {
+    // Active policy defaults under a per-user config root, not process.cwd()
+    // (cwd is often the replaceable package or MCPB unpack directory).
     this.policyPath =
-      options?.policyPath === undefined
-        ? path.resolve(process.cwd(), DEFAULT_POLICY_FILENAME)
-        : path.resolve(options.policyPath);
+      options?.policyPath !== undefined
+        ? path.resolve(options.policyPath)
+        : resolveGuwahActivePolicyPath({
+            configBaseDir:
+              options?.configBaseDir !== undefined
+                ? options.configBaseDir
+                : resolveGuwahUserConfigBaseDir(),
+          });
     this.limits = resolveResourceLimits(options?.resourceLimits);
     const policyAjv = createStrictAjv();
     this.policyDocumentValidator = policyAjv.compile(POLICY_DOCUMENT_SCHEMA);
     this.toolAjv = createStrictAjv();
+  }
+
+  /** Absolute path of the active policy file this guard loads. */
+  public getActivePolicyPath(): string {
+    return this.policyPath;
   }
 
   /**

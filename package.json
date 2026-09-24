@@ -24,6 +24,11 @@
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc -p tsconfig.json",
     "test": "vitest run",
+    "test:core": "vitest run test/guwahGuard.test.ts",
+    "test:gateway": "vitest run test/guwahMcpAdapter.test.ts && vitest run test/guwahGateway.test.ts --testNamePattern \"guwahGateway entry|gateway start|MCP initialization handshake|gateway initialize|MCP capability negotiation|stdio |malformed MCP messages|gateway EOF|broken-pipe stdout|termination signals|active request registry|concurrency bounds|stdio backpressure|gateway shutdown|clean shutdown lifecycle|stdout protocol purity|redacted stderr diagnostics|tools/list|tools/call|validate before dispatch|complete call envelope|alternate-envelope bypass|structured MCP errors|GuwahSecurityViolation MCP mapping\"",
+    "test:integration": "vitest run test/guwahFakeDownstream.test.ts && vitest run test/guwahGateway.test.ts --testNamePattern \"official MCP downstream client|downstream transport configuration|downstream connection|fail-closed reconnection|fail closed on ambiguous downstream state|downstream tool discovery|monitor downstream tool discovery changes|handle downstream tool-list mutation|handle downstream schema changes|mirror authorized tools|deterministic tool namespacing|tool-name collisions|policy binding for mirrored tools|deny unknown tools|deny newly discovered tools|deny unmirrored tools|candidate-argument parity at the gateway boundary|forward only the exact approved copy|approved forwarding|blocked-forwarding invocation proof|prevent direct downstream bypass|direct-bypass prevention\"",
+    "demo:heartbeat": "vitest run --config vitest.demo.config.ts scripts/demoHeartbeat.ts",
+    "demo:golden": "vitest run --config vitest.demo.config.ts scripts/demoGolden.ts",
     "gateway": "node dist/guwahGateway.js"
   },
   "dependencies": {

@@ -93,7 +93,7 @@ src/guwahGateway.ts       Node stdio gateway entry
 test/guwahGuard.test.ts
 test/guwahMcpAdapter.test.ts
 test/guwahGateway.test.ts
-guwah-policy.json         Local operator policy
+guwah-policy.json         Packaged sample policy (not the live active file)
 package.json
 tsconfig.json             Shared typecheck configuration
 tsconfig.build.json       Production emit (src only)
@@ -109,7 +109,7 @@ Intended deployment exposes only the Guwah gateway process to the host MCP clien
 
 ### `src/guwahGuard.ts`
 
-Runtime exports include `GuwahGuard`, `GuwahSecurityViolation`, and `DEFAULT_GUWAH_RESOURCE_LIMITS`. The module also exports TypeScript interfaces and violation-code types for integration. The public method accepts runtime-unknown values because agent and host objects cannot be trusted at the type boundary:
+Runtime exports include `GuwahGuard`, `GuwahSecurityViolation`, `DEFAULT_GUWAH_RESOURCE_LIMITS`, `resolveGuwahActivePolicyPath`, `resolveGuwahUserConfigBaseDir`, `resolveGuwahPackagedSamplePolicyPath`, `provisionGuwahActivePolicy`, `resolveGuwahLivePolicyPath`, `isGuwahPathInsideRoot`, `GUWAH_ACTIVE_POLICY_FILENAME`, `GUWAH_ACTIVE_POLICY_SUBDIR`, `GUWAH_USER_CONFIG_DIR_UNAVAILABLE`, `GUWAH_SAMPLE_POLICY_UNAVAILABLE`, and `GUWAH_ACTIVE_POLICY_PROVISION_ERROR`. The module also exports TypeScript interfaces and violation-code types for integration. The public method accepts runtime-unknown values because agent and host objects cannot be trusted at the type boundary:
 
 ```ts
 validateToolCall(
@@ -124,14 +124,18 @@ Contract after JSON-graph admission:
 
 1. Require a plain MCP-compatible `tools/call` envelope.
 2. Require plain-object candidate arguments.
-3. Load `guwah-policy.json` from disk on every validation (SHA-256 cache identity only; not a signature).
+3. Load the active policy file from disk on every validation (SHA-256 cache identity only; not a signature).
 4. Bound the parsed policy object graph, then validate the policy document and each tool `argsSchema`.
 5. Reject unknown tools and tools not configured with `ENFORCE`.
 6. Compare `payload.params.arguments` to `args` when embedded arguments exist.
 7. Validate exact values with Ajv (`coerceTypes: false`, `useDefaults: false`, `removeAdditional: false`).
 8. Return a deep-frozen defensive copy, or throw `GuwahSecurityViolation`.
 
-Default policy path: `path.resolve(process.cwd(), "guwah-policy.json")`.
+Default active policy path: `path.resolve(<configBaseDir>, "guwah", "guwah-policy.json")`, where `<configBaseDir>` is the constructor `configBaseDir` option or the platform user-config base from `resolveGuwahUserConfigBaseDir()` when omitted (`%APPDATA%` on Windows, `~/Library/Application Support` on macOS). Unsupported platforms fail closed rather than using `/tmp` or `process.cwd()`. Explicit `policyPath` overrides that resolution. The active file is not the sole copy inside a replaceable package or MCPB unpack tree; hosts should inject `configBaseDir` in tests and deployments that need a deterministic root.
+
+`provisionGuwahActivePolicy()` copies the packaged sample (`guwah-policy.json` at the package root) to the active path only when that file is absent. When the active file is already present, provisioning is skipped: operator edits survive restart and package upgrades, and sample tools are never silently merged into the active document. Failed copies remove incomplete destination or temp bytes so they are not trusted as the live policy.
+
+`resolveGuwahLivePolicyPath()` is the startup resolver: it provisions when needed and returns the active path. If a caller points at the packaged sample while a distinct active user-config file already exists, the active path is used instead so validation never treats the writable bundle sample as the live file.
 
 ### Resource limits
 
@@ -164,7 +168,7 @@ Admitted forms are concatenations of literals and character classes. Groups, alt
 
 ### `guwah-policy.json`
 
-Local constraint document. It is operator-editable and is not integrity-protected by this package.
+Packaged sample policy shipped with the package. It is not the live active file. On stdio gateway startup, Guwah copies this sample to the per-user active path only when that active file is absent; afterwards the gateway validates against the active path. Operator edits belong on the active file under the user configuration directory, not on the sample inside a replaceable package or MCPB unpack tree.
 
 Sample mapping for the example tool `coinbase_cdp_transfer`:
 
